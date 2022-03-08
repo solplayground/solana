@@ -3,64 +3,71 @@
 #[macro_use]
 extern crate solana_bpf_loader_program;
 
-use itertools::izip;
-use log::{log_enabled, trace, Level::Trace};
-use solana_account_decoder::parse_bpf_loader::{
-    parse_bpf_upgradeable_loader, BpfUpgradeableLoaderAccountType,
-};
-use solana_bpf_loader_program::{
-    create_vm,
-    serialization::{deserialize_parameters, serialize_parameters},
-    syscalls::register_syscalls,
-    BpfError, ThisInstructionMeter,
-};
-use solana_bpf_rust_invoke::instructions::*;
-use solana_bpf_rust_realloc::instructions::*;
-use solana_bpf_rust_realloc_invoke::instructions::*;
-use solana_program_runtime::{
-    compute_budget::ComputeBudget, invoke_context::with_mock_invoke_context,
-    timings::ExecuteTimings,
-};
-use solana_rbpf::{
-    elf::Executable,
-    static_analysis::Analysis,
-    vm::{Config, Tracer},
-};
-use solana_runtime::{
-    bank::{
-        Bank, DurableNonceFee, TransactionBalancesSet, TransactionExecutionDetails,
-        TransactionExecutionResult, TransactionResults,
+use {
+    itertools::izip,
+    log::{log_enabled, trace, Level::Trace},
+    solana_account_decoder::parse_bpf_loader::{
+        parse_bpf_upgradeable_loader, BpfUpgradeableLoaderAccountType,
     },
-    bank_client::BankClient,
-    genesis_utils::{create_genesis_config, GenesisConfigInfo},
-    loader_utils::{
-        load_buffer_account, load_program, load_upgradeable_program, set_upgrade_authority,
-        upgrade_program,
+    solana_bpf_loader_program::{
+        create_vm,
+        serialization::{deserialize_parameters, serialize_parameters},
+        syscalls::register_syscalls,
+        BpfError, ThisInstructionMeter,
     },
+    solana_bpf_rust_invoke::instructions::*,
+    solana_bpf_rust_realloc::instructions::*,
+    solana_bpf_rust_realloc_invoke::instructions::*,
+    solana_program_runtime::{
+        compute_budget::ComputeBudget, invoke_context::with_mock_invoke_context,
+        timings::ExecuteTimings,
+    },
+    solana_rbpf::{
+        elf::Executable,
+        static_analysis::Analysis,
+        vm::{Config, Tracer},
+    },
+    solana_runtime::{
+        bank::{
+            Bank, DurableNonceFee, TransactionBalancesSet, TransactionExecutionDetails,
+            TransactionExecutionResult, TransactionResults,
+        },
+        bank_client::BankClient,
+        genesis_utils::{create_genesis_config, GenesisConfigInfo},
+        loader_utils::{
+            load_buffer_account, load_program, load_upgradeable_program, set_upgrade_authority,
+            upgrade_program,
+        },
+    },
+    solana_sdk::{
+        account::{AccountSharedData, ReadableAccount},
+        account_utils::StateMut,
+        bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable,
+        client::SyncClient,
+        clock::MAX_PROCESSING_AGE,
+        compute_budget::ComputeBudgetInstruction,
+        entrypoint::{MAX_PERMITTED_DATA_INCREASE, SUCCESS},
+        feature_set::FeatureSet,
+        fee::FeeStructure,
+        fee_calculator::FeeRateGovernor,
+        instruction::{AccountMeta, CompiledInstruction, Instruction, InstructionError},
+        loader_instruction,
+        message::{v0::LoadedAddresses, Message, SanitizedMessage},
+        pubkey::Pubkey,
+        rent::Rent,
+        signature::{keypair_from_seed, Keypair, Signer},
+        system_instruction::{self, MAX_PERMITTED_DATA_LENGTH},
+        system_program,
+        sysvar::{self, clock, rent},
+        transaction::{SanitizedTransaction, Transaction, TransactionError, VersionedTransaction},
+    },
+    solana_transaction_status::{
+        token_balances::collect_token_balances, ConfirmedTransactionWithStatusMeta,
+        InnerInstructions, TransactionStatusMeta, TransactionWithStatusMeta,
+        VersionedTransactionWithStatusMeta,
+    },
+    std::{collections::HashMap, env, fs::File, io::Read, path::PathBuf, str::FromStr, sync::Arc},
 };
-use solana_sdk::{
-    account::{AccountSharedData, ReadableAccount},
-    account_utils::StateMut,
-    bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable,
-    client::SyncClient,
-    clock::MAX_PROCESSING_AGE,
-    compute_budget::ComputeBudgetInstruction,
-    entrypoint::{MAX_PERMITTED_DATA_INCREASE, SUCCESS},
-    instruction::{AccountMeta, CompiledInstruction, Instruction, InstructionError},
-    loader_instruction,
-    message::{v0::LoadedAddresses, Message, SanitizedMessage},
-    pubkey::Pubkey,
-    signature::{keypair_from_seed, Keypair, Signer},
-    system_instruction::{self, MAX_PERMITTED_DATA_LENGTH},
-    system_program, sysvar,
-    sysvar::{clock, rent},
-    transaction::{SanitizedTransaction, Transaction, TransactionError},
-};
-use solana_transaction_status::{
-    token_balances::collect_token_balances, ConfirmedTransactionWithStatusMeta, InnerInstructions,
-    TransactionStatusMeta, TransactionWithStatusMeta,
-};
-use std::{collections::HashMap, env, fs::File, io::Read, path::PathBuf, str::FromStr, sync::Arc};
 
 /// BPF program file extension
 const PLATFORM_FILE_EXTENSION_BPF: &str = "so";
@@ -211,10 +218,7 @@ fn run_program(name: &str) -> u64 {
         let mut instruction_meter = ThisInstructionMeter { compute_meter };
         let config = Config {
             enable_instruction_tracing: true,
-            reject_unresolved_syscalls: true,
-            reject_section_virtual_address_file_offset_mismatch: true,
-            verify_mul64_imm_nonzero: false,
-            verify_shift32_imm: true,
+            reject_broken_elfs: true,
             ..Config::default()
         };
         let mut executable = Executable::<BpfError, ThisInstructionMeter>::from_elf(
@@ -229,15 +233,15 @@ fn run_program(name: &str) -> u64 {
         let mut instruction_count = 0;
         let mut tracer = None;
         for i in 0..2 {
-            invoke_context
-                .transaction_context
-                .set_return_data(
-                    *invoke_context
-                        .transaction_context
-                        .get_program_key()
-                        .unwrap(),
-                    Vec::new(),
-                )
+            let transaction_context = &mut invoke_context.transaction_context;
+            let instruction_context = transaction_context
+                .get_current_instruction_context()
+                .unwrap();
+            let caller = *instruction_context
+                .get_program_key(transaction_context)
+                .unwrap();
+            transaction_context
+                .set_return_data(caller, Vec::new())
                 .unwrap();
             let mut parameter_bytes = parameter_bytes.clone();
             {
@@ -400,7 +404,7 @@ fn execute_transactions(
                         ),
                     }
                     .expect("lamports_per_signature must be available");
-                    let fee = Bank::get_fee_for_message_with_lamports_per_signature(
+                    let fee = bank.get_fee_for_message_with_lamports_per_signature(
                         &SanitizedMessage::try_from(tx.message().clone()).unwrap(),
                         lamports_per_signature,
                     );
@@ -432,10 +436,12 @@ fn execute_transactions(
 
                     Ok(ConfirmedTransactionWithStatusMeta {
                         slot: bank.slot(),
-                        transaction: TransactionWithStatusMeta {
-                            transaction: tx.clone(),
-                            meta: Some(tx_status_meta),
-                        },
+                        tx_with_meta: TransactionWithStatusMeta::Complete(
+                            VersionedTransactionWithStatusMeta {
+                                transaction: VersionedTransaction::from(tx.clone()),
+                                meta: tx_status_meta,
+                            },
+                        ),
                         block_time: None,
                     })
                 }
@@ -1116,6 +1122,18 @@ fn test_program_bpf_invoke_sanity() {
             &[],
         );
 
+        do_invoke_failure_test_local(
+            TEST_DUPLICATE_PRIVILEGE_ESCALATION_SIGNER,
+            TransactionError::InstructionError(0, InstructionError::PrivilegeEscalation),
+            &[invoked_program_id.clone()],
+        );
+
+        do_invoke_failure_test_local(
+            TEST_DUPLICATE_PRIVILEGE_ESCALATION_WRITABLE,
+            TransactionError::InstructionError(0, InstructionError::PrivilegeEscalation),
+            &[invoked_program_id.clone()],
+        );
+
         // Check resulting state
 
         assert_eq!(43, bank.get_balance(&derived_key1));
@@ -1372,7 +1390,7 @@ fn test_program_bpf_compute_budget() {
     );
     let message = Message::new(
         &[
-            ComputeBudgetInstruction::request_units(1),
+            ComputeBudgetInstruction::request_units(1, 0),
             Instruction::new_with_bincode(program_id, &0, vec![]),
         ],
         Some(&mint_keypair.pubkey()),
@@ -1411,20 +1429,20 @@ fn assert_instruction_count() {
     {
         programs.extend_from_slice(&[
             ("solana_bpf_rust_128bit", 584),
-            ("solana_bpf_rust_alloc", 7388),
-            ("solana_bpf_rust_custom_heap", 536),
-            ("solana_bpf_rust_dep_crate", 47),
-            ("solana_bpf_rust_external_spend", 507),
-            ("solana_bpf_rust_iter", 824),
+            ("solana_bpf_rust_alloc", 4559),
+            ("solana_bpf_rust_custom_heap", 458),
+            ("solana_bpf_rust_dep_crate", 2),
+            ("solana_bpf_rust_external_spend", 327),
+            ("solana_bpf_rust_iter", 108),
             ("solana_bpf_rust_many_args", 1289),
-            ("solana_bpf_rust_mem", 5997),
-            ("solana_bpf_rust_membuiltins", 3976),
-            ("solana_bpf_rust_noop", 481),
+            ("solana_bpf_rust_mem", 2217),
+            ("solana_bpf_rust_membuiltins", 1705),
+            ("solana_bpf_rust_noop", 315),
             ("solana_bpf_rust_param_passing", 146),
-            ("solana_bpf_rust_rand", 488),
+            ("solana_bpf_rust_rand", 418),
             ("solana_bpf_rust_sanity", 9128),
-            ("solana_bpf_rust_secp256k1_recover", 25889),
-            ("solana_bpf_rust_sha", 30692),
+            ("solana_bpf_rust_secp256k1_recover", 25707),
+            ("solana_bpf_rust_sha", 27033),
         ]);
     }
 
@@ -2467,10 +2485,10 @@ fn test_program_upgradeable_locks() {
     assert!(matches!(
         results1[0],
         Ok(ConfirmedTransactionWithStatusMeta {
-            transaction: TransactionWithStatusMeta {
-                meta: Some(TransactionStatusMeta { status: Ok(()), .. }),
+            tx_with_meta: TransactionWithStatusMeta::Complete(VersionedTransactionWithStatusMeta {
+                meta: TransactionStatusMeta { status: Ok(()), .. },
                 ..
-            },
+            }),
             ..
         })
     ));
@@ -2479,16 +2497,16 @@ fn test_program_upgradeable_locks() {
     assert!(matches!(
         results2[0],
         Ok(ConfirmedTransactionWithStatusMeta {
-            transaction: TransactionWithStatusMeta {
-                meta: Some(TransactionStatusMeta {
+            tx_with_meta: TransactionWithStatusMeta::Complete(VersionedTransactionWithStatusMeta {
+                meta: TransactionStatusMeta {
                     status: Err(TransactionError::InstructionError(
                         0,
                         InstructionError::ProgramFailedToComplete
                     )),
                     ..
-                }),
+                },
                 ..
-            },
+            }),
             ..
         })
     ));
@@ -2624,11 +2642,13 @@ fn test_program_bpf_ro_account_modify() {
 fn test_program_bpf_realloc() {
     solana_logger::setup();
 
+    const START_BALANCE: u64 = 100_000_000_000;
+
     let GenesisConfigInfo {
         genesis_config,
         mint_keypair,
         ..
-    } = create_genesis_config(50);
+    } = create_genesis_config(1_000_000_000_000);
     let mint_pubkey = mint_keypair.pubkey();
     let signer = &[&mint_keypair];
 
@@ -2648,7 +2668,7 @@ fn test_program_bpf_realloc() {
     let mut bump = 0;
     let keypair = Keypair::new();
     let pubkey = keypair.pubkey();
-    let account = AccountSharedData::new(42, 5, &program_id);
+    let account = AccountSharedData::new(START_BALANCE, 5, &program_id);
     bank.store_account(&pubkey, &account);
 
     // Realloc RO account
@@ -2875,16 +2895,19 @@ fn test_program_bpf_realloc() {
         .unwrap();
 }
 
-#[cfg(feature = "bpf_rust")]
 #[test]
+#[cfg(feature = "bpf_rust")]
 fn test_program_bpf_realloc_invoke() {
     solana_logger::setup();
 
+    const START_BALANCE: u64 = 100_000_000_000;
+
     let GenesisConfigInfo {
-        genesis_config,
+        mut genesis_config,
         mint_keypair,
         ..
-    } = create_genesis_config(50);
+    } = create_genesis_config(1_000_000_000_000);
+    genesis_config.rent = Rent::default();
     let mint_pubkey = mint_keypair.pubkey();
     let signer = &[&mint_keypair];
 
@@ -2911,7 +2934,7 @@ fn test_program_bpf_realloc_invoke() {
     let mut bump = 0;
     let keypair = Keypair::new();
     let pubkey = keypair.pubkey().clone();
-    let account = AccountSharedData::new(42, 5, &realloc_program_id);
+    let account = AccountSharedData::new(START_BALANCE, 5, &realloc_program_id);
     bank.store_account(&pubkey, &account);
     let invoke_keypair = Keypair::new();
     let invoke_pubkey = invoke_keypair.pubkey().clone();
@@ -2937,6 +2960,8 @@ fn test_program_bpf_realloc_invoke() {
             .unwrap(),
         TransactionError::InstructionError(0, InstructionError::ReadonlyDataModified)
     );
+    let account = bank.get_account(&pubkey).unwrap();
+    assert_eq!(account.lamports(), START_BALANCE);
 
     // Realloc account to 0
     bank_client
@@ -2948,6 +2973,8 @@ fn test_program_bpf_realloc_invoke() {
             ),
         )
         .unwrap();
+    let account = bank.get_account(&pubkey).unwrap();
+    assert_eq!(account.lamports(), START_BALANCE);
     let data = bank_client.get_account_data(&pubkey).unwrap().unwrap();
     assert_eq!(0, data.len());
 
@@ -2995,54 +3022,7 @@ fn test_program_bpf_realloc_invoke() {
         TransactionError::InstructionError(0, InstructionError::InvalidRealloc)
     );
 
-    // Realloc to max length in max increase increments
-    for i in 0..MAX_PERMITTED_DATA_LENGTH as usize / MAX_PERMITTED_DATA_INCREASE {
-        bank_client
-            .send_and_confirm_message(
-                signer,
-                Message::new(
-                    &[Instruction::new_with_bytes(
-                        realloc_invoke_program_id,
-                        &[INVOKE_REALLOC_EXTEND_MAX, 1, i as u8, (i / 255) as u8],
-                        vec![
-                            AccountMeta::new(pubkey, false),
-                            AccountMeta::new_readonly(realloc_program_id, false),
-                        ],
-                    )],
-                    Some(&mint_pubkey),
-                ),
-            )
-            .unwrap();
-        let data = bank_client.get_account_data(&pubkey).unwrap().unwrap();
-        assert_eq!((i + 1) * MAX_PERMITTED_DATA_INCREASE, data.len());
-    }
-    for i in 0..data.len() {
-        assert_eq!(data[i], 1);
-    }
-
-    // and one more time should fail
-    assert_eq!(
-        bank_client
-            .send_and_confirm_message(
-                signer,
-                Message::new(
-                    &[Instruction::new_with_bytes(
-                        realloc_invoke_program_id,
-                        &[INVOKE_REALLOC_EXTEND_MAX, 2, 1, 1],
-                        vec![
-                            AccountMeta::new(pubkey, false),
-                            AccountMeta::new_readonly(realloc_program_id, false),
-                        ],
-                    )],
-                    Some(&mint_pubkey),
-                )
-            )
-            .unwrap_err()
-            .unwrap(),
-        TransactionError::InstructionError(0, InstructionError::InvalidRealloc)
-    );
-
-    // Realloc to 0
+    // Realloc account to 0
     bank_client
         .send_and_confirm_message(
             signer,
@@ -3052,6 +3032,8 @@ fn test_program_bpf_realloc_invoke() {
             ),
         )
         .unwrap();
+    let account = bank.get_account(&pubkey).unwrap();
+    assert_eq!(account.lamports(), START_BALANCE);
     let data = bank_client.get_account_data(&pubkey).unwrap().unwrap();
     assert_eq!(0, data.len());
 
@@ -3152,7 +3134,7 @@ fn test_program_bpf_realloc_invoke() {
     assert_eq!(0, data.len());
 
     // Realloc to 100 and check via CPI
-    let invoke_account = AccountSharedData::new(42, 5, &realloc_invoke_program_id);
+    let invoke_account = AccountSharedData::new(START_BALANCE, 5, &realloc_invoke_program_id);
     bank.store_account(&invoke_pubkey, &invoke_account);
     bank_client
         .send_and_confirm_message(
@@ -3179,42 +3161,6 @@ fn test_program_bpf_realloc_invoke() {
         assert_eq!(data[i], 0);
     }
     for i in 5..data.len() {
-        assert_eq!(data[i], 2);
-    }
-
-    // Realloc rescursively and fill data
-    let invoke_keypair = Keypair::new();
-    let invoke_pubkey = invoke_keypair.pubkey().clone();
-    let invoke_account = AccountSharedData::new(42, 0, &realloc_invoke_program_id);
-    bank.store_account(&invoke_pubkey, &invoke_account);
-    let mut instruction_data = vec![];
-    instruction_data.extend_from_slice(&[INVOKE_REALLOC_RECURSIVE, 1]);
-    instruction_data.extend_from_slice(&100_usize.to_le_bytes());
-    bank_client
-        .send_and_confirm_message(
-            signer,
-            Message::new(
-                &[Instruction::new_with_bytes(
-                    realloc_invoke_program_id,
-                    &instruction_data,
-                    vec![
-                        AccountMeta::new(invoke_pubkey, false),
-                        AccountMeta::new_readonly(realloc_invoke_program_id, false),
-                    ],
-                )],
-                Some(&mint_pubkey),
-            ),
-        )
-        .unwrap();
-    let data = bank_client
-        .get_account_data(&invoke_pubkey)
-        .unwrap()
-        .unwrap();
-    assert_eq!(200, data.len());
-    for i in 0..100 {
-        assert_eq!(data[i], 1);
-    }
-    for i in 100..200 {
         assert_eq!(data[i], 2);
     }
 
@@ -3250,7 +3196,7 @@ fn test_program_bpf_realloc_invoke() {
     // Invoke, dealloc, and assign
     let pre_len = 100;
     let new_len = pre_len * 2;
-    let mut invoke_account = AccountSharedData::new(42, pre_len, &realloc_program_id);
+    let mut invoke_account = AccountSharedData::new(START_BALANCE, pre_len, &realloc_program_id);
     invoke_account.set_data_from_slice(&vec![1; pre_len]);
     bank.store_account(&invoke_pubkey, &invoke_account);
     let mut instruction_data = vec![];
@@ -3330,4 +3276,249 @@ fn test_program_bpf_realloc_invoke() {
             .unwrap(),
         TransactionError::InstructionError(0, InstructionError::InvalidRealloc)
     );
+
+    // Realloc to 0
+    bank_client
+        .send_and_confirm_message(
+            signer,
+            Message::new(
+                &[realloc(&realloc_program_id, &pubkey, 0, &mut bump)],
+                Some(&mint_pubkey),
+            ),
+        )
+        .unwrap();
+    let data = bank_client.get_account_data(&pubkey).unwrap().unwrap();
+    assert_eq!(0, data.len());
+
+    // Realloc to max length in max increase increments
+    for i in 0..MAX_PERMITTED_DATA_LENGTH as usize / MAX_PERMITTED_DATA_INCREASE {
+        bank_client
+            .send_and_confirm_message(
+                signer,
+                Message::new(
+                    &[Instruction::new_with_bytes(
+                        realloc_invoke_program_id,
+                        &[INVOKE_REALLOC_EXTEND_MAX, 1, i as u8, (i / 255) as u8],
+                        vec![
+                            AccountMeta::new(pubkey, false),
+                            AccountMeta::new_readonly(realloc_program_id, false),
+                        ],
+                    )],
+                    Some(&mint_pubkey),
+                ),
+            )
+            .unwrap();
+        let data = bank_client.get_account_data(&pubkey).unwrap().unwrap();
+        assert_eq!((i + 1) * MAX_PERMITTED_DATA_INCREASE, data.len());
+    }
+    for i in 0..data.len() {
+        assert_eq!(data[i], 1);
+    }
+
+    // and one more time should fail
+    assert_eq!(
+        bank_client
+            .send_and_confirm_message(
+                signer,
+                Message::new(
+                    &[Instruction::new_with_bytes(
+                        realloc_invoke_program_id,
+                        &[INVOKE_REALLOC_EXTEND_MAX, 2, 1, 1],
+                        vec![
+                            AccountMeta::new(pubkey, false),
+                            AccountMeta::new_readonly(realloc_program_id, false),
+                        ],
+                    )],
+                    Some(&mint_pubkey),
+                )
+            )
+            .unwrap_err()
+            .unwrap(),
+        TransactionError::InstructionError(0, InstructionError::InvalidRealloc)
+    );
+
+    // Realloc rescursively and fill data
+    let invoke_keypair = Keypair::new();
+    let invoke_pubkey = invoke_keypair.pubkey().clone();
+    let invoke_account = AccountSharedData::new(START_BALANCE, 0, &realloc_invoke_program_id);
+    bank.store_account(&invoke_pubkey, &invoke_account);
+    let mut instruction_data = vec![];
+    instruction_data.extend_from_slice(&[INVOKE_REALLOC_RECURSIVE, 1]);
+    instruction_data.extend_from_slice(&100_usize.to_le_bytes());
+    bank_client
+        .send_and_confirm_message(
+            signer,
+            Message::new(
+                &[Instruction::new_with_bytes(
+                    realloc_invoke_program_id,
+                    &instruction_data,
+                    vec![
+                        AccountMeta::new(invoke_pubkey, false),
+                        AccountMeta::new_readonly(realloc_invoke_program_id, false),
+                    ],
+                )],
+                Some(&mint_pubkey),
+            ),
+        )
+        .unwrap();
+    let data = bank_client
+        .get_account_data(&invoke_pubkey)
+        .unwrap()
+        .unwrap();
+    assert_eq!(200, data.len());
+    for i in 0..100 {
+        assert_eq!(data[i], 1);
+    }
+    for i in 100..200 {
+        assert_eq!(data[i], 2);
+    }
+}
+
+#[test]
+#[cfg(any(feature = "bpf_rust"))]
+fn test_program_bpf_processed_inner_instruction() {
+    solana_logger::setup();
+
+    let GenesisConfigInfo {
+        genesis_config,
+        mint_keypair,
+        ..
+    } = create_genesis_config(50);
+    let mut bank = Bank::new_for_tests(&genesis_config);
+    let (name, id, entrypoint) = solana_bpf_loader_program!();
+    bank.add_builtin(&name, &id, entrypoint);
+    let bank = Arc::new(bank);
+    let bank_client = BankClient::new_shared(&bank);
+
+    let sibling_program_id = load_bpf_program(
+        &bank_client,
+        &bpf_loader::id(),
+        &mint_keypair,
+        "solana_bpf_rust_sibling_instructions",
+    );
+    let sibling_inner_program_id = load_bpf_program(
+        &bank_client,
+        &bpf_loader::id(),
+        &mint_keypair,
+        "solana_bpf_rust_sibling_inner_instructions",
+    );
+    let noop_program_id = load_bpf_program(
+        &bank_client,
+        &bpf_loader::id(),
+        &mint_keypair,
+        "solana_bpf_rust_noop",
+    );
+    let invoke_and_return_program_id = load_bpf_program(
+        &bank_client,
+        &bpf_loader::id(),
+        &mint_keypair,
+        "solana_bpf_rust_invoke_and_return",
+    );
+
+    let instruction2 = Instruction::new_with_bytes(
+        noop_program_id,
+        &[43],
+        vec![
+            AccountMeta::new_readonly(noop_program_id, false),
+            AccountMeta::new(mint_keypair.pubkey(), true),
+        ],
+    );
+    let instruction1 = Instruction::new_with_bytes(
+        noop_program_id,
+        &[42],
+        vec![
+            AccountMeta::new(mint_keypair.pubkey(), true),
+            AccountMeta::new_readonly(noop_program_id, false),
+        ],
+    );
+    let instruction0 = Instruction::new_with_bytes(
+        sibling_program_id,
+        &[1, 2, 3, 0, 4, 5, 6],
+        vec![
+            AccountMeta::new(mint_keypair.pubkey(), true),
+            AccountMeta::new_readonly(noop_program_id, false),
+            AccountMeta::new_readonly(invoke_and_return_program_id, false),
+            AccountMeta::new_readonly(sibling_inner_program_id, false),
+        ],
+    );
+    let message = Message::new(
+        &[instruction2, instruction1, instruction0],
+        Some(&mint_keypair.pubkey()),
+    );
+    assert!(bank_client
+        .send_and_confirm_message(&[&mint_keypair], message)
+        .is_ok());
+}
+
+#[test]
+#[cfg(feature = "bpf_rust")]
+fn test_program_fees() {
+    solana_logger::setup();
+
+    let congestion_multiplier = 1;
+
+    let GenesisConfigInfo {
+        mut genesis_config,
+        mint_keypair,
+        ..
+    } = create_genesis_config(500_000_000);
+    genesis_config.fee_rate_governor = FeeRateGovernor::new(congestion_multiplier, 0);
+    let mut bank = Bank::new_for_tests(&genesis_config);
+    let fee_structure =
+        FeeStructure::new(0.000005, 0.0, vec![(200, 0.0000005), (1400000, 0.000005)]);
+    bank.fee_structure = fee_structure.clone();
+    bank.feature_set = Arc::new(FeatureSet::all_enabled());
+
+    let (name, id, entrypoint) = solana_bpf_loader_program!();
+    bank.add_builtin(&name, &id, entrypoint);
+    let bank_client = BankClient::new(bank);
+
+    let program_id = load_bpf_program(
+        &bank_client,
+        &bpf_loader::id(),
+        &mint_keypair,
+        "solana_bpf_rust_noop",
+    );
+
+    let pre_balance = bank_client.get_balance(&mint_keypair.pubkey()).unwrap();
+    let message = Message::new(
+        &[Instruction::new_with_bytes(program_id, &[], vec![])],
+        Some(&mint_keypair.pubkey()),
+    );
+
+    let sanitized_message = SanitizedMessage::try_from(message.clone()).unwrap();
+    let expected_max_fee = Bank::calculate_fee(
+        &sanitized_message,
+        congestion_multiplier,
+        &fee_structure,
+        true,
+    );
+    bank_client
+        .send_and_confirm_message(&[&mint_keypair], message)
+        .unwrap();
+    let post_balance = bank_client.get_balance(&mint_keypair.pubkey()).unwrap();
+    assert_eq!(pre_balance - post_balance, expected_max_fee);
+
+    let pre_balance = bank_client.get_balance(&mint_keypair.pubkey()).unwrap();
+    let message = Message::new(
+        &[
+            ComputeBudgetInstruction::request_units(100, 42),
+            Instruction::new_with_bytes(program_id, &[], vec![]),
+        ],
+        Some(&mint_keypair.pubkey()),
+    );
+    let sanitized_message = SanitizedMessage::try_from(message.clone()).unwrap();
+    let expected_min_fee = Bank::calculate_fee(
+        &sanitized_message,
+        congestion_multiplier,
+        &fee_structure,
+        true,
+    );
+    assert!(expected_min_fee < expected_max_fee);
+
+    bank_client
+        .send_and_confirm_message(&[&mint_keypair], message)
+        .unwrap();
+    let post_balance = bank_client.get_balance(&mint_keypair.pubkey()).unwrap();
+    assert_eq!(pre_balance - post_balance, expected_min_fee);
 }

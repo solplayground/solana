@@ -5,7 +5,7 @@ use {
         message::{
             legacy::Message as LegacyMessage,
             v0::{self, LoadedAddresses},
-            MessageHeader,
+            AccountKeys, MessageHeader,
         },
         nonce::NONCED_TX_MARKER_IX_INDEX,
         program_utils::limited_deserialize,
@@ -18,14 +18,13 @@ use {
     thiserror::Error,
 };
 
-/// Sanitized message of a transaction which includes a set of atomic
-/// instructions to be executed on-chain
+/// Sanitized message of a transaction.
 #[derive(Debug, Clone)]
 pub enum SanitizedMessage {
     /// Sanitized legacy message
     Legacy(LegacyMessage),
     /// Sanitized version #0 message with dynamically loaded addresses
-    V0(v0::LoadedMessage),
+    V0(v0::LoadedMessage<'static>),
 }
 
 #[derive(PartialEq, Debug, Error, Eq, Clone)]
@@ -70,7 +69,7 @@ impl SanitizedMessage {
     pub fn header(&self) -> &MessageHeader {
         match self {
             Self::Legacy(message) => &message.header,
-            Self::V0(message) => &message.header,
+            Self::V0(loaded_msg) => &loaded_msg.message.header,
         }
     }
 
@@ -85,7 +84,8 @@ impl SanitizedMessage {
 
     /// Returns the fee payer for the transaction
     pub fn fee_payer(&self) -> &Pubkey {
-        self.get_account_key(0)
+        self.account_keys()
+            .get(0)
             .expect("sanitized message always has non-program fee payer at index 0")
     }
 
@@ -93,7 +93,7 @@ impl SanitizedMessage {
     pub fn recent_blockhash(&self) -> &Hash {
         match self {
             Self::Legacy(message) => &message.recent_blockhash,
-            Self::V0(message) => &message.recent_blockhash,
+            Self::V0(loaded_msg) => &loaded_msg.message.recent_blockhash,
         }
     }
 
@@ -102,7 +102,7 @@ impl SanitizedMessage {
     pub fn instructions(&self) -> &[CompiledInstruction] {
         match self {
             Self::Legacy(message) => &message.instructions,
-            Self::V0(message) => &message.instructions,
+            Self::V0(loaded_msg) => &loaded_msg.message.instructions,
         }
     }
 
@@ -111,40 +111,21 @@ impl SanitizedMessage {
     pub fn program_instructions_iter(
         &self,
     ) -> impl Iterator<Item = (&Pubkey, &CompiledInstruction)> {
-        match self {
-            Self::Legacy(message) => message.instructions.iter(),
-            Self::V0(message) => message.instructions.iter(),
-        }
-        .map(move |ix| {
+        self.instructions().iter().map(move |ix| {
             (
-                self.get_account_key(usize::from(ix.program_id_index))
+                self.account_keys()
+                    .get(usize::from(ix.program_id_index))
                     .expect("program id index is sanitized"),
                 ix,
             )
         })
     }
 
-    /// Iterator of all account keys referenced in this message, including dynamically loaded keys.
-    pub fn account_keys_iter(&self) -> Box<dyn Iterator<Item = &Pubkey> + '_> {
+    /// Returns the list of account keys that are loaded for this message.
+    pub fn account_keys(&self) -> AccountKeys {
         match self {
-            Self::Legacy(message) => Box::new(message.account_keys.iter()),
-            Self::V0(message) => Box::new(message.account_keys_iter()),
-        }
-    }
-
-    /// Length of all account keys referenced in this message, including dynamically loaded keys.
-    pub fn account_keys_len(&self) -> usize {
-        match self {
-            Self::Legacy(message) => message.account_keys.len(),
-            Self::V0(message) => message.account_keys_len(),
-        }
-    }
-
-    /// Returns the address of the account at the specified index.
-    pub fn get_account_key(&self, index: usize) -> Option<&Pubkey> {
-        match self {
-            Self::Legacy(message) => message.account_keys.get(index),
-            Self::V0(message) => message.get_account_key(index),
+            Self::Legacy(message) => AccountKeys::new(&message.account_keys, None),
+            Self::V0(message) => message.account_keys(),
         }
     }
 
@@ -210,7 +191,7 @@ impl SanitizedMessage {
     }
 
     fn try_position(&self, key: &Pubkey) -> Option<u8> {
-        u8::try_from(self.account_keys_iter().position(|k| k == key)?).ok()
+        u8::try_from(self.account_keys().iter().position(|k| k == key)?).ok()
     }
 
     /// Try to compile an instruction using the account keys in this message.
@@ -230,6 +211,7 @@ impl SanitizedMessage {
 
     /// Decompile message instructions without cloning account keys
     pub fn decompile_instructions(&self) -> Vec<BorrowedInstruction> {
+        let account_keys = self.account_keys();
         self.program_instructions_iter()
             .map(|(program_id, instruction)| {
                 let accounts = instruction
@@ -240,7 +222,7 @@ impl SanitizedMessage {
                         BorrowedAccountMeta {
                             is_signer: self.is_signer(account_index),
                             is_writable: self.is_writable(account_index),
-                            pubkey: self.get_account_key(account_index).unwrap(),
+                            pubkey: account_keys.get(account_index).unwrap(),
                         }
                     })
                     .collect();
@@ -267,7 +249,7 @@ impl SanitizedMessage {
         self.instructions()
             .get(NONCED_TX_MARKER_IX_INDEX as usize)
             .filter(
-                |ix| match self.get_account_key(ix.program_id_index as usize) {
+                |ix| match self.account_keys().get(ix.program_id_index as usize) {
                     Some(program_id) => system_program::check_id(program_id),
                     _ => false,
                 },
@@ -284,7 +266,7 @@ impl SanitizedMessage {
                     if nonce_must_be_writable && !self.is_writable(idx) {
                         None
                     } else {
-                        self.get_account_key(idx)
+                        self.account_keys().get(idx)
                     }
                 })
             })
@@ -361,8 +343,8 @@ mod tests {
 
         assert_eq!(legacy_message.num_readonly_accounts(), 2);
 
-        let v0_message = SanitizedMessage::V0(v0::LoadedMessage {
-            message: v0::Message {
+        let v0_message = SanitizedMessage::V0(v0::LoadedMessage::new(
+            v0::Message {
                 header: MessageHeader {
                     num_required_signatures: 2,
                     num_readonly_signed_accounts: 1,
@@ -371,11 +353,11 @@ mod tests {
                 account_keys: vec![key0, key1, key2, key3],
                 ..v0::Message::default()
             },
-            loaded_addresses: LoadedAddresses {
+            LoadedAddresses {
                 writable: vec![key4],
                 readonly: vec![key5],
             },
-        });
+        ));
 
         assert_eq!(v0_message.num_readonly_accounts(), 3);
     }
@@ -428,8 +410,8 @@ mod tests {
         })
         .unwrap();
 
-        let v0_message = SanitizedMessage::V0(v0::LoadedMessage {
-            message: v0::Message {
+        let v0_message = SanitizedMessage::V0(v0::LoadedMessage::new(
+            v0::Message {
                 header: MessageHeader {
                     num_required_signatures: 1,
                     num_readonly_signed_accounts: 0,
@@ -438,11 +420,11 @@ mod tests {
                 account_keys: vec![key0, key1],
                 ..v0::Message::default()
             },
-            loaded_addresses: LoadedAddresses {
+            LoadedAddresses {
                 writable: vec![key2],
                 readonly: vec![program_id],
             },
-        });
+        ));
 
         for message in vec![legacy_message, v0_message] {
             assert_eq!(

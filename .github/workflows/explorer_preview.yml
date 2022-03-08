@@ -17,23 +17,23 @@ jobs:
           vercel-token: ${{ secrets.VERCEL_TOKEN }} # Required
           github-token: ${{ secrets.GITHUB_TOKEN }} #Optional 
           vercel-org-id: ${{ secrets.ORG_ID}}  #Required
-          vercel-project-id: ${{ secrets.PROJECT_ID}} #Required 
-          working-directory: ./explorer
+          vercel-project-id: ${{ secrets.PROJECT_ID}} #Required
           scope: ${{ secrets.TEAM_ID }}
      
       - name: vercel url
         run : |
               touch vercelfile.txt
-              vercel --token ${{secrets.VERCEL_TOKEN}} --scope ${{ secrets.TEAM_ID }} ls solana > vercelfile.txt
-              echo "first line"
+              vercel --token ${{secrets.VERCEL_TOKEN}}  ls explorer --scope team_8A2WD7p4uR7tmKX9M68loHXI > vercelfile.txt
               touch vercelfile1.txt
               head -n 2 vercelfile.txt > vercelfile1.txt
               touch vercelfile2.txt
               tail -n 1 vercelfile1.txt > vercelfile2.txt
-              filtered_url=$(cut -f8 -d" " vercelfile2.txt)
+              filtered_url7=$(cut -f7 -d" " vercelfile2.txt)
+              echo "filtered_url7 is: $filtered_url7" 
               touch .env.preview1
-              echo "$filtered_url" > .env.preview1
-              echo "filtered_url is: $filtered_url" 
+              echo "$filtered_url7" > .env.preview1
+              #filtered_url=$(cat vercelfile2.txt )
+              #echo "$filtered_url" >> .env.preview1 
 
 
       - name: Run tests

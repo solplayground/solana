@@ -25,6 +25,7 @@ use {
         account_info::AccountInfo,
         clock::Slot,
         entrypoint::{ProgramResult, SUCCESS},
+        feature_set::FEATURE_NAMES,
         fee_calculator::{FeeCalculator, FeeRateGovernor},
         genesis_config::{ClusterType, GenesisConfig},
         hash::Hash,
@@ -57,7 +58,10 @@ use {
     tokio::task::JoinHandle,
 };
 // Export types so test clients can limit their solana crate dependencies
-pub use {solana_banks_client::BanksClient, solana_program_runtime::invoke_context::InvokeContext};
+pub use {
+    solana_banks_client::{BanksClient, BanksClientError},
+    solana_program_runtime::invoke_context::InvokeContext,
+};
 
 pub mod programs;
 
@@ -101,8 +105,12 @@ pub fn builtin_process_instruction(
         ..instruction_context.get_number_of_accounts();
 
     let log_collector = invoke_context.get_log_collector();
-    let program_id = transaction_context.get_program_key()?;
-    stable_log::program_invoke(&log_collector, program_id, invoke_context.invoke_depth());
+    let program_id = instruction_context.get_program_key(transaction_context)?;
+    stable_log::program_invoke(
+        &log_collector,
+        program_id,
+        invoke_context.get_stack_height(),
+    );
 
     // Copy indices_in_instruction into a HashSet to ensure there are no duplicates
     let deduplicated_indices: HashSet<usize> = indices_in_instruction.clone().collect();
@@ -174,8 +182,8 @@ pub fn builtin_process_instruction(
         let mut borrowed_account =
             instruction_context.try_borrow_account(transaction_context, index_in_instruction)?;
         if borrowed_account.is_writable() {
-            borrowed_account.set_lamports(lamports)?;
-            borrowed_account.set_data(&data)?;
+            borrowed_account.set_lamports(lamports);
+            borrowed_account.set_data(&data);
         }
     }
 
@@ -242,21 +250,23 @@ impl solana_sdk::program_stubs::SyscallStubs for SyscallStubs {
     ) -> ProgramResult {
         let invoke_context = get_invoke_context();
         let log_collector = invoke_context.get_log_collector();
-
-        let caller = *invoke_context
-            .transaction_context
-            .get_program_key()
+        let transaction_context = &invoke_context.transaction_context;
+        let instruction_context = transaction_context
+            .get_current_instruction_context()
+            .unwrap();
+        let caller = instruction_context
+            .get_program_key(transaction_context)
             .unwrap();
 
         stable_log::program_invoke(
             &log_collector,
             &instruction.program_id,
-            invoke_context.invoke_depth(),
+            invoke_context.get_stack_height(),
         );
 
         let signers = signers_seeds
             .iter()
-            .map(|seeds| Pubkey::create_program_address(seeds, &caller).unwrap())
+            .map(|seeds| Pubkey::create_program_address(seeds, caller).unwrap())
             .collect::<Vec<_>>();
         let (instruction_accounts, program_indices) = invoke_context
             .prepare_instruction(instruction, &signers)
@@ -267,7 +277,8 @@ impl solana_sdk::program_stubs::SyscallStubs for SyscallStubs {
         for instruction_account in instruction_accounts.iter() {
             let account_key = invoke_context
                 .transaction_context
-                .get_key_of_account_at_index(instruction_account.index_in_transaction);
+                .get_key_of_account_at_index(instruction_account.index_in_transaction)
+                .unwrap();
             let account_info_index = account_infos
                 .iter()
                 .position(|account_info| account_info.unsigned_key() == account_key)
@@ -277,6 +288,7 @@ impl solana_sdk::program_stubs::SyscallStubs for SyscallStubs {
             let mut account = invoke_context
                 .transaction_context
                 .get_account_at_index(instruction_account.index_in_transaction)
+                .unwrap()
                 .borrow_mut();
             account.copy_into_owner_from_slice(account_info.owner.as_ref());
             account.set_data_from_slice(&account_info.try_borrow_data().unwrap());
@@ -305,6 +317,7 @@ impl solana_sdk::program_stubs::SyscallStubs for SyscallStubs {
             let account = invoke_context
                 .transaction_context
                 .get_account_at_index(index_in_transaction)
+                .unwrap()
                 .borrow_mut();
             let account_info = &account_infos[account_info_index];
             **account_info.try_borrow_mut_lamports().unwrap() = account.lamports();
@@ -363,12 +376,14 @@ impl solana_sdk::program_stubs::SyscallStubs for SyscallStubs {
 
     fn sol_set_return_data(&self, data: &[u8]) {
         let invoke_context = get_invoke_context();
-        let caller = *invoke_context
-            .transaction_context
-            .get_program_key()
+        let transaction_context = &mut invoke_context.transaction_context;
+        let instruction_context = transaction_context
+            .get_current_instruction_context()
             .unwrap();
-        invoke_context
-            .transaction_context
+        let caller = *instruction_context
+            .get_program_key(transaction_context)
+            .unwrap();
+        transaction_context
             .set_return_data(caller, data.to_vec())
             .unwrap();
     }
@@ -417,7 +432,8 @@ fn setup_fees(bank: Bank) -> Bank {
         &[],     // transactions
         &mut [], // loaded accounts
         vec![],  // transaction execution results
-        0,       // tx count
+        0,       // executed tx count
+        0,       // executed with failure output tx count
         1,       // signature count
         &mut ExecuteTimings::default(),
     );
@@ -448,6 +464,7 @@ pub struct ProgramTest {
     compute_max_units: Option<u64>,
     prefer_bpf: bool,
     use_bpf_jit: bool,
+    deactivate_feature_set: HashSet<Pubkey>,
 }
 
 impl Default for ProgramTest {
@@ -478,6 +495,7 @@ impl Default for ProgramTest {
             compute_max_units: None,
             prefer_bpf,
             use_bpf_jit: false,
+            deactivate_feature_set: HashSet::default(),
         }
     }
 }
@@ -707,6 +725,13 @@ impl ProgramTest {
             .push(Builtin::new(program_name, program_id, process_instruction));
     }
 
+    /// Deactivate a runtime feature.
+    ///
+    /// Note that all features are activated by default.
+    pub fn deactivate_feature(&mut self, feature_id: Pubkey) {
+        self.deactivate_feature_set.insert(feature_id);
+    }
+
     fn setup_bank(
         &self,
     ) -> (
@@ -746,6 +771,25 @@ impl ProgramTest {
             ClusterType::Development,
             vec![],
         );
+
+        // Remove features tagged to deactivate
+        for deactivate_feature_pk in &self.deactivate_feature_set {
+            if FEATURE_NAMES.contains_key(deactivate_feature_pk) {
+                match genesis_config.accounts.remove(deactivate_feature_pk) {
+                    Some(_) => debug!("Feature for {:?} deactivated", deactivate_feature_pk),
+                    None => warn!(
+                        "Feature {:?} set for deactivation not found in genesis_config account list, ignored.",
+                        deactivate_feature_pk
+                    ),
+                }
+            } else {
+                warn!(
+                    "Feature {:?} set for deactivation is not a known Feature public key",
+                    deactivate_feature_pk
+                );
+            }
+        }
+
         let target_tick_duration = Duration::from_micros(100);
         genesis_config.poh_config = PohConfig::new_sleep(target_tick_duration);
         debug!("Payer address: {}", mint_keypair.pubkey());
@@ -1067,26 +1111,33 @@ impl ProgramTestContext {
             bank.register_tick(&Hash::new_unique());
         }
 
-        // warp ahead to one slot *before* the desired slot because the warped
-        // bank is frozen
+        // Ensure that we are actually progressing forward
         let working_slot = bank.slot();
         if warp_slot <= working_slot {
             return Err(ProgramTestError::InvalidWarpSlot);
         }
 
+        // Warp ahead to one slot *before* the desired slot because the bank
+        // from Bank::warp_from_parent() is frozen. If the desired slot is one
+        // slot *after* the working_slot, no need to warp at all.
         let pre_warp_slot = warp_slot - 1;
-        let warp_bank = bank_forks.insert(Bank::warp_from_parent(
-            &bank,
-            &Pubkey::default(),
-            pre_warp_slot,
-        ));
+        let warp_bank = if pre_warp_slot == working_slot {
+            bank.freeze();
+            bank
+        } else {
+            bank_forks.insert(Bank::warp_from_parent(
+                &bank,
+                &Pubkey::default(),
+                pre_warp_slot,
+            ))
+        };
         bank_forks.set_root(
             pre_warp_slot,
             &solana_runtime::accounts_background_service::AbsRequestSender::default(),
             Some(pre_warp_slot),
         );
 
-        // warp bank is frozen, so go forward one slot from it
+        // warp_bank is frozen so go forward to get unfrozen bank at warp_slot
         bank_forks.insert(Bank::new_from_parent(
             &warp_bank,
             &Pubkey::default(),

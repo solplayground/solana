@@ -1,13 +1,12 @@
 //! The `blockstore` module provides functions for parallel verification of the
 //! Proof of History ledger as well as iterative read, append write, and random
 //! access read to a persistent file-based ledger.
-pub use crate::{blockstore_db::BlockstoreError, blockstore_meta::SlotMeta};
 use {
     crate::{
         ancestor_iterator::AncestorIterator,
         blockstore_db::{
-            columns as cf, AccessType, BlockstoreOptions, Column, Database, IteratorDirection,
-            IteratorMode, LedgerColumn, Result, WriteBatch,
+            columns as cf, AccessType, BlockstoreOptions, Column, ColumnName, Database,
+            IteratorDirection, IteratorMode, LedgerColumn, Result, ShredStorageType, WriteBatch,
         },
         blockstore_meta::*,
         leader_schedule_cache::LeaderScheduleCache,
@@ -42,8 +41,8 @@ use {
     },
     solana_storage_proto::{StoredExtendedRewards, StoredTransactionStatusMeta},
     solana_transaction_status::{
-        ConfirmedTransactionStatusWithSignature, Rewards, TransactionStatusMeta,
-        VersionedConfirmedBlock, VersionedConfirmedTransactionWithStatusMeta,
+        ConfirmedTransactionStatusWithSignature, ConfirmedTransactionWithStatusMeta, Rewards,
+        TransactionStatusMeta, TransactionWithStatusMeta, VersionedConfirmedBlock,
         VersionedTransactionWithStatusMeta,
     },
     std::{
@@ -66,11 +65,16 @@ use {
     thiserror::Error,
     trees::{Tree, TreeWalk},
 };
+pub use {
+    crate::{blockstore_db::BlockstoreError, blockstore_meta::SlotMeta},
+    rocksdb::properties as RocksProperties,
+};
 
 pub mod blockstore_purge;
 
-pub const BLOCKSTORE_DIRECTORY: &str = "rocksdb";
-pub const ROCKSDB_TOTAL_SST_FILES_SIZE: &str = "rocksdb.total-sst-files-size";
+pub const BLOCKSTORE_DIRECTORY_ROCKS_LEVEL: &str = "rocksdb";
+pub const BLOCKSTORE_DIRECTORY_ROCKS_FIFO: &str = "rocksdb_fifo";
+pub const BLOCKSTORE_METRICS_ERROR: i64 = -1;
 
 thread_local!(static PAR_THREAD_POOL: RefCell<ThreadPool> = RefCell::new(rayon::ThreadPoolBuilder::new()
                     .num_threads(get_thread_count())
@@ -104,9 +108,16 @@ pub struct SignatureInfosForAddress {
 }
 
 #[derive(Clone, Copy)]
+/// Controls how `blockstore::purge_slots` purges the data.
 pub enum PurgeType {
+    /// A slower but more accurate way to purge slots by also ensuring higher
+    /// level of consistency between data during the clean up process.
     Exact,
+    /// A faster approximation of `Exact` where the purge process only takes
+    /// care of the primary index and does not update the associated entries.
     PrimaryIndex,
+    /// The fastest purge mode that relies on the slot-id based TTL
+    /// compaction filter to do the cleanup.
     CompactionFilter,
 }
 
@@ -195,11 +206,18 @@ pub struct IndexMetaWorkingSetEntry {
     did_insert_occur: bool,
 }
 
+/// The in-memory data structure for updating entries in the column family
+/// [`cf::SlotMeta`].
 pub struct SlotMetaWorkingSetEntry {
+    /// The dirty version of the `SlotMeta` which might not be persisted
+    /// to the blockstore yet.
     new_slot_meta: Rc<RefCell<SlotMeta>>,
+    /// The latest version of the `SlotMeta` that was persisted in the
+    /// blockstore.  If None, it means the current slot is new to the
+    /// blockstore.
     old_slot_meta: Option<SlotMeta>,
-    // True only if at least one shred for this SlotMeta was inserted since the time this
-    // struct was created.
+    /// True only if at least one shred for this SlotMeta was inserted since
+    /// this struct was created.
     did_insert_occur: bool,
 }
 
@@ -238,7 +256,104 @@ pub struct BlockstoreInsertionMetrics {
     num_coding_shreds_inserted: usize,
 }
 
+#[derive(Default)]
+/// A metrics struct that exposes RocksDB's column family properties.
+///
+/// Here we only expose a subset of all the internal properties which are
+/// relevant to the ledger store performance.
+///
+/// The list of completed RocksDB internal properties can be found
+/// [here](https://github.com/facebook/rocksdb/blob/08809f5e6cd9cc4bc3958dd4d59457ae78c76660/include/rocksdb/db.h#L654-L689).
+pub struct BlockstoreRocksDbColumnFamilyMetrics {
+    // Size related
+
+    // The storage size occupied by the column family.
+    // RocksDB's internal property key: "rocksdb.total-sst-files-size"
+    pub total_sst_files_size: i64,
+    // The memory size occupied by the column family's in-memory buffer.
+    // RocksDB's internal property key: "rocksdb.size-all-mem-tables"
+    pub size_all_mem_tables: i64,
+
+    // Snapshot related
+
+    // Number of snapshots hold for the column family.
+    // RocksDB's internal property key: "rocksdb.num-snapshots"
+    pub num_snapshots: i64,
+    // Unit timestamp of the oldest unreleased snapshot.
+    // RocksDB's internal property key: "rocksdb.oldest-snapshot-time"
+    pub oldest_snapshot_time: i64,
+
+    // Write related
+
+    // The current actual delayed write rate. 0 means no delay.
+    // RocksDB's internal property key: "rocksdb.actual-delayed-write-rate"
+    pub actual_delayed_write_rate: i64,
+    // A flag indicating whether writes are stopped on this column family.
+    // 1 indicates writes have been stopped.
+    // RocksDB's internal property key: "rocksdb.is-write-stopped"
+    pub is_write_stopped: i64,
+
+    // Memory / block cache related
+
+    // The block cache capacity of the column family.
+    // RocksDB's internal property key: "rocksdb.block-cache-capacity"
+    pub block_cache_capacity: i64,
+    // The memory size used by the column family in the block cache.
+    // RocksDB's internal property key: "rocksdb.block-cache-usage"
+    pub block_cache_usage: i64,
+    // The memory size used by the column family in the block cache where
+    // entries are pinned.
+    // RocksDB's internal property key: "rocksdb.block-cache-pinned-usage"
+    pub block_cache_pinned_usage: i64,
+
+    // The estimated memory size used for reading SST tables in this column
+    // family such as filters and index blocks. Note that this number does not
+    // include the memory used in block cache.
+    // RocksDB's internal property key: "rocksdb.estimate-table-readers-mem"
+    pub estimate_table_readers_mem: i64,
+
+    // Flush and compaction
+
+    // A 1 or 0 flag indicating whether a memtable flush is pending.
+    // If this number is 1, it means a memtable is waiting for being flushed,
+    // but there might be too many L0 files that prevents it from being flushed.
+    // RocksDB's internal property key: "rocksdb.mem-table-flush-pending"
+    pub mem_table_flush_pending: i64,
+
+    // A 1 or 0 flag indicating whether a compaction job is pending.
+    // If this number is 1, it means some part of the column family requires
+    // compaction in order to maintain shape of LSM tree, but the compaction
+    // is pending because the desired compaction job is either waiting for
+    // other dependnent compactions to be finished or waiting for an available
+    // compaction thread.
+    // RocksDB's internal property key: "rocksdb.compaction-pending"
+    pub compaction_pending: i64,
+
+    // The number of compactions that are currently running for the column family.
+    // RocksDB's internal property key: "rocksdb.num-running-compactions"
+    pub num_running_compactions: i64,
+
+    // The number of flushes that are currently running for the column family.
+    // RocksDB's internal property key: "rocksdb.num-running-flushes"
+    pub num_running_flushes: i64,
+
+    // FIFO Compaction related
+
+    // returns an estimation of the oldest key timestamp in the DB. Only vailable
+    // for FIFO compaction with compaction_options_fifo.allow_compaction = false.
+    // RocksDB's internal property key: "rocksdb.estimate-oldest-key-time"
+    pub estimate_oldest_key_time: i64,
+
+    // Misc
+
+    // The accumulated number of RocksDB background errors.
+    // RocksDB's internal property key: "rocksdb.background-errors"
+    pub background_errors: i64,
+}
+
 impl SlotMetaWorkingSetEntry {
+    /// Construct a new SlotMetaWorkingSetEntry with the specified `new_slot_meta`
+    /// and `old_slot_meta`.  `did_insert_occur` is set to false.
     fn new(new_slot_meta: Rc<RefCell<SlotMeta>>, old_slot_meta: Option<SlotMeta>) -> Self {
         Self {
             new_slot_meta,
@@ -331,13 +446,94 @@ impl BlockstoreInsertionMetrics {
     }
 }
 
+impl BlockstoreRocksDbColumnFamilyMetrics {
+    /// Report metrics with the specified metric name and column family tag.
+    /// The metric name and the column family tag is embeded in the parameter
+    /// `metric_name_and_cf_tag` with the following format.
+    ///
+    /// For example, "blockstore_rocksdb_cfs,cf_name=shred_data".
+    pub fn report_metrics(&self, metric_name_and_cf_tag: &'static str) {
+        datapoint_info!(
+            metric_name_and_cf_tag,
+            // Size related
+            (
+                "total_sst_files_size",
+                self.total_sst_files_size as i64,
+                i64
+            ),
+            ("size_all_mem_tables", self.size_all_mem_tables as i64, i64),
+            // Snapshot related
+            ("num_snapshots", self.num_snapshots as i64, i64),
+            (
+                "oldest_snapshot_time",
+                self.oldest_snapshot_time as i64,
+                i64
+            ),
+            // Write related
+            (
+                "actual_delayed_write_rate",
+                self.actual_delayed_write_rate as i64,
+                i64
+            ),
+            ("is_write_stopped", self.is_write_stopped as i64, i64),
+            // Memory / block cache related
+            (
+                "block_cache_capacity",
+                self.block_cache_capacity as i64,
+                i64
+            ),
+            ("block_cache_usage", self.block_cache_usage as i64, i64),
+            (
+                "block_cache_pinned_usage",
+                self.block_cache_pinned_usage as i64,
+                i64
+            ),
+            (
+                "estimate_table_readers_mem",
+                self.estimate_table_readers_mem as i64,
+                i64
+            ),
+            // Flush and compaction
+            (
+                "mem_table_flush_pending",
+                self.mem_table_flush_pending as i64,
+                i64
+            ),
+            ("compaction_pending", self.compaction_pending as i64, i64),
+            (
+                "num_running_compactions",
+                self.num_running_compactions as i64,
+                i64
+            ),
+            ("num_running_flushes", self.num_running_flushes as i64, i64),
+            // FIFO Compaction related
+            (
+                "estimate_oldest_key_time",
+                self.estimate_oldest_key_time as i64,
+                i64
+            ),
+            // Misc
+            ("background_errors", self.background_errors as i64, i64),
+        );
+    }
+}
+
 impl Blockstore {
     pub fn db(self) -> Arc<Database> {
         self.db
     }
 
+    /// The path to the ledger store
     pub fn ledger_path(&self) -> &PathBuf {
         &self.ledger_path
+    }
+
+    /// The directory under `ledger_path` to the underlying blockstore.
+    pub fn blockstore_directory(shred_storage_type: &ShredStorageType) -> &str {
+        match shred_storage_type {
+            ShredStorageType::RocksLevel => BLOCKSTORE_DIRECTORY_ROCKS_LEVEL,
+            ShredStorageType::RocksFifo(_) => BLOCKSTORE_DIRECTORY_ROCKS_FIFO,
+        }
     }
 
     /// Opens a Ledger in directory, provides "infinite" window of shreds
@@ -351,7 +547,8 @@ impl Blockstore {
 
     fn do_open(ledger_path: &Path, options: BlockstoreOptions) -> Result<Blockstore> {
         fs::create_dir_all(&ledger_path)?;
-        let blockstore_path = ledger_path.join(BLOCKSTORE_DIRECTORY);
+        let blockstore_path =
+            ledger_path.join(Self::blockstore_directory(&options.shred_storage_type));
 
         adjust_ulimit_nofile(options.enforce_ulimit_nofile)?;
 
@@ -516,21 +713,36 @@ impl Blockstore {
         }
     }
 
+    /// Whether to disable compaction in [`compact_storage`], which is used
+    /// by the ledger cleanup service and [`backup_and_clear_blockstore`].
+    ///
+    /// Note that this setting is not related to the RocksDB's background
+    /// compaction.
+    ///
+    /// To disable RocksDB's background compaction, open the Blockstore
+    /// with AccessType::PrimaryOnlyForMaintenance.
     pub fn set_no_compaction(&mut self, no_compaction: bool) {
         self.no_compaction = no_compaction;
     }
 
+    /// Deletes the blockstore at the specified path.
+    ///
+    /// Note that if the `ledger_path` has multiple rocksdb instances, this
+    /// function will destroy all.
     pub fn destroy(ledger_path: &Path) -> Result<()> {
-        // Database::destroy() fails if the path doesn't exist
+        // Database::destroy() fails if the root directory doesn't exist
         fs::create_dir_all(ledger_path)?;
-        let blockstore_path = ledger_path.join(BLOCKSTORE_DIRECTORY);
-        Database::destroy(&blockstore_path)
+        Database::destroy(&Path::new(ledger_path).join(BLOCKSTORE_DIRECTORY_ROCKS_LEVEL)).and(
+            Database::destroy(&Path::new(ledger_path).join(BLOCKSTORE_DIRECTORY_ROCKS_FIFO)),
+        )
     }
 
+    /// Returns the SlotMeta of the specified slot.
     pub fn meta(&self, slot: Slot) -> Result<Option<SlotMeta>> {
         self.meta_cf.get(slot)
     }
 
+    /// Returns true if the specified slot is full.
     pub fn is_full(&self, slot: Slot) -> bool {
         if let Ok(Some(meta)) = self.meta_cf.get(slot) {
             return meta.is_full();
@@ -542,11 +754,17 @@ impl Blockstore {
         self.erasure_meta_cf.get(erasure_set.store_key())
     }
 
+    /// Check whether the specified slot is an orphan slot which does not
+    /// have a parent slot.
+    ///
+    /// Returns true if the specified slot does not have a parent slot.
+    /// For other return values, it means either the slot is not in the
+    /// blockstore or the slot isn't an orphan slot.
     pub fn orphan(&self, slot: Slot) -> Result<Option<bool>> {
         self.orphans_cf.get(slot)
     }
 
-    // Get max root or 0 if it doesn't exist
+    /// Returns the max root or 0 if it does not exist.
     pub fn max_root(&self) -> Slot {
         self.db
             .iter::<cf::Root>(IteratorMode::End)
@@ -714,6 +932,98 @@ impl Blockstore {
             ("recovery_status", status, String),
             ("recovered", recovered as i64, i64),
         );
+    }
+
+    /// Collects and reports [`BlockstoreRocksDbColumnFamilyMetrics`] for the
+    /// all the column families.
+    pub fn submit_rocksdb_cf_metrics_for_all_cfs(&self) {
+        self.submit_rocksdb_cf_metrics::<cf::SlotMeta>(rocksdb_cf_metric!("slot_meta"));
+        self.submit_rocksdb_cf_metrics::<cf::DeadSlots>(rocksdb_cf_metric!("dead_slots"));
+        self.submit_rocksdb_cf_metrics::<cf::DuplicateSlots>(rocksdb_cf_metric!("duplicate_slots"));
+        self.submit_rocksdb_cf_metrics::<cf::ErasureMeta>(rocksdb_cf_metric!("erasure_meta"));
+        self.submit_rocksdb_cf_metrics::<cf::Orphans>(rocksdb_cf_metric!("orphans"));
+        self.submit_rocksdb_cf_metrics::<cf::BankHash>(rocksdb_cf_metric!("bank_hash"));
+        self.submit_rocksdb_cf_metrics::<cf::Root>(rocksdb_cf_metric!("root"));
+        self.submit_rocksdb_cf_metrics::<cf::Index>(rocksdb_cf_metric!("index"));
+        self.submit_rocksdb_cf_metrics::<cf::ShredData>(rocksdb_cf_metric!("shred_data"));
+        self.submit_rocksdb_cf_metrics::<cf::ShredCode>(rocksdb_cf_metric!("shred_code"));
+        self.submit_rocksdb_cf_metrics::<cf::TransactionStatus>(rocksdb_cf_metric!(
+            "transaction_status"
+        ));
+        self.submit_rocksdb_cf_metrics::<cf::AddressSignatures>(rocksdb_cf_metric!(
+            "address_signature"
+        ));
+        self.submit_rocksdb_cf_metrics::<cf::TransactionMemos>(rocksdb_cf_metric!(
+            "transaction_memos"
+        ));
+        self.submit_rocksdb_cf_metrics::<cf::TransactionStatusIndex>(rocksdb_cf_metric!(
+            "transaction_status_index"
+        ));
+        self.submit_rocksdb_cf_metrics::<cf::Rewards>(rocksdb_cf_metric!("rewards"));
+        self.submit_rocksdb_cf_metrics::<cf::Blocktime>(rocksdb_cf_metric!("blocktime"));
+        self.submit_rocksdb_cf_metrics::<cf::PerfSamples>(rocksdb_cf_metric!("perf_sample"));
+        self.submit_rocksdb_cf_metrics::<cf::BlockHeight>(rocksdb_cf_metric!("block_height"));
+        self.submit_rocksdb_cf_metrics::<cf::ProgramCosts>(rocksdb_cf_metric!("program_costs"));
+    }
+
+    /// Collects and reports [`BlockstoreRocksDbColumnFamilyMetrics`] for the
+    /// given column family.
+    fn submit_rocksdb_cf_metrics<C: 'static + Column + ColumnName>(
+        &self,
+        metric_name_and_cf_tag: &'static str,
+    ) {
+        let cf = self.db.column::<C>();
+        let cf_rocksdb_metrics = BlockstoreRocksDbColumnFamilyMetrics {
+            total_sst_files_size: cf
+                .get_int_property(RocksProperties::TOTAL_SST_FILES_SIZE)
+                .unwrap_or(BLOCKSTORE_METRICS_ERROR),
+            size_all_mem_tables: cf
+                .get_int_property(RocksProperties::SIZE_ALL_MEM_TABLES)
+                .unwrap_or(BLOCKSTORE_METRICS_ERROR),
+            num_snapshots: cf
+                .get_int_property(RocksProperties::NUM_SNAPSHOTS)
+                .unwrap_or(BLOCKSTORE_METRICS_ERROR),
+            oldest_snapshot_time: cf
+                .get_int_property(RocksProperties::OLDEST_SNAPSHOT_TIME)
+                .unwrap_or(BLOCKSTORE_METRICS_ERROR),
+            actual_delayed_write_rate: cf
+                .get_int_property(RocksProperties::ACTUAL_DELAYED_WRITE_RATE)
+                .unwrap_or(BLOCKSTORE_METRICS_ERROR),
+            is_write_stopped: cf
+                .get_int_property(RocksProperties::IS_WRITE_STOPPED)
+                .unwrap_or(BLOCKSTORE_METRICS_ERROR),
+            block_cache_capacity: cf
+                .get_int_property(RocksProperties::BLOCK_CACHE_CAPACITY)
+                .unwrap_or(BLOCKSTORE_METRICS_ERROR),
+            block_cache_usage: cf
+                .get_int_property(RocksProperties::BLOCK_CACHE_USAGE)
+                .unwrap_or(BLOCKSTORE_METRICS_ERROR),
+            block_cache_pinned_usage: cf
+                .get_int_property(RocksProperties::BLOCK_CACHE_PINNED_USAGE)
+                .unwrap_or(BLOCKSTORE_METRICS_ERROR),
+            estimate_table_readers_mem: cf
+                .get_int_property(RocksProperties::ESTIMATE_TABLE_READERS_MEM)
+                .unwrap_or(BLOCKSTORE_METRICS_ERROR),
+            mem_table_flush_pending: cf
+                .get_int_property(RocksProperties::MEM_TABLE_FLUSH_PENDING)
+                .unwrap_or(BLOCKSTORE_METRICS_ERROR),
+            compaction_pending: cf
+                .get_int_property(RocksProperties::COMPACTION_PENDING)
+                .unwrap_or(BLOCKSTORE_METRICS_ERROR),
+            num_running_compactions: cf
+                .get_int_property(RocksProperties::NUM_RUNNING_COMPACTIONS)
+                .unwrap_or(BLOCKSTORE_METRICS_ERROR),
+            num_running_flushes: cf
+                .get_int_property(RocksProperties::NUM_RUNNING_FLUSHES)
+                .unwrap_or(BLOCKSTORE_METRICS_ERROR),
+            estimate_oldest_key_time: cf
+                .get_int_property(RocksProperties::ESTIMATE_OLDEST_KEY_TIME)
+                .unwrap_or(BLOCKSTORE_METRICS_ERROR),
+            background_errors: cf
+                .get_int_property(RocksProperties::BACKGROUND_ERRORS)
+                .unwrap_or(BLOCKSTORE_METRICS_ERROR),
+        };
+        cf_rocksdb_metrics.report_metrics(metric_name_and_cf_tag);
     }
 
     fn try_shred_recovery(
@@ -1230,7 +1540,7 @@ impl Blockstore {
     /// - `index_meta_time`: the time spent on loading or creating the
     ///     index meta entry from the db.
     /// - `is_trusted`: if false, this function will check whether the
-    ///     input shred is dupliate.
+    ///     input shred is duplicate.
     /// - `handle_duplicate`: the function that handles duplication.
     /// - `leader_schedule`: the leader schedule will be used to check
     ///     whether it is okay to insert the input shred.
@@ -1909,9 +2219,13 @@ impl Blockstore {
         self.block_height_cf.put(slot, &block_height)
     }
 
+    /// The first complete block that is available in the Blockstore ledger
     pub fn get_first_available_block(&self) -> Result<Slot> {
         let mut root_iterator = self.rooted_slot_iterator(self.lowest_slot())?;
-        Ok(root_iterator.next().unwrap_or_default())
+        // The block at root-index 0 cannot be complete, because it is missing its parent
+        // blockhash. A parent blockhash must be calculated from the entries of the previous block.
+        // Therefore, the first available complete block is that at root-index 1.
+        Ok(root_iterator.nth(1).unwrap_or_default())
     }
 
     pub fn get_rooted_block(
@@ -2019,9 +2333,8 @@ impl Blockstore {
                 Ok(VersionedTransactionWithStatusMeta {
                     transaction,
                     meta: self
-                        .read_transaction_status((signature, slot))
-                        .ok()
-                        .flatten(),
+                        .read_transaction_status((signature, slot))?
+                        .ok_or(BlockstoreError::MissingTransactionMetadata)?,
                 })
             })
             .collect()
@@ -2270,7 +2583,7 @@ impl Blockstore {
     pub fn get_rooted_transaction(
         &self,
         signature: Signature,
-    ) -> Result<Option<VersionedConfirmedTransactionWithStatusMeta>> {
+    ) -> Result<Option<ConfirmedTransactionWithStatusMeta>> {
         datapoint_info!(
             "blockstore-rpc-api",
             ("method", "get_rooted_transaction", String)
@@ -2283,7 +2596,7 @@ impl Blockstore {
         &self,
         signature: Signature,
         highest_confirmed_slot: Slot,
-    ) -> Result<Option<VersionedConfirmedTransactionWithStatusMeta>> {
+    ) -> Result<Option<ConfirmedTransactionWithStatusMeta>> {
         datapoint_info!(
             "blockstore-rpc-api",
             ("method", "get_complete_transaction", String)
@@ -2300,8 +2613,8 @@ impl Blockstore {
         &self,
         signature: Signature,
         confirmed_unrooted_slots: &[Slot],
-    ) -> Result<Option<VersionedConfirmedTransactionWithStatusMeta>> {
-        if let Some((slot, status)) =
+    ) -> Result<Option<ConfirmedTransactionWithStatusMeta>> {
+        if let Some((slot, meta)) =
             self.get_transaction_status(signature, confirmed_unrooted_slots)?
         {
             let transaction = self
@@ -2309,12 +2622,11 @@ impl Blockstore {
                 .ok_or(BlockstoreError::TransactionStatusSlotMismatch)?; // Should not happen
 
             let block_time = self.get_block_time(slot)?;
-            Ok(Some(VersionedConfirmedTransactionWithStatusMeta {
+            Ok(Some(ConfirmedTransactionWithStatusMeta {
                 slot,
-                tx_with_meta: VersionedTransactionWithStatusMeta {
-                    transaction,
-                    meta: Some(status),
-                },
+                tx_with_meta: TransactionWithStatusMeta::Complete(
+                    VersionedTransactionWithStatusMeta { transaction, meta },
+                ),
                 block_time,
             }))
         } else {
@@ -3151,18 +3463,18 @@ impl Blockstore {
     ///
     /// Note that the reported size does not include those recently inserted
     /// shreds that are still in memory.
-    pub fn total_data_shred_storage_size(&self) -> Result<u64> {
+    pub fn total_data_shred_storage_size(&self) -> Result<i64> {
         let shred_data_cf = self.db.column::<cf::ShredData>();
-        shred_data_cf.get_int_property(ROCKSDB_TOTAL_SST_FILES_SIZE)
+        shred_data_cf.get_int_property(RocksProperties::TOTAL_SST_FILES_SIZE)
     }
 
     /// Returns the total physical storage size contributed by all coding shreds.
     ///
     /// Note that the reported size does not include those recently inserted
     /// shreds that are still in memory.
-    pub fn total_coding_shred_storage_size(&self) -> Result<u64> {
+    pub fn total_coding_shred_storage_size(&self) -> Result<i64> {
         let shred_code_cf = self.db.column::<cf::ShredCode>();
-        shred_code_cf.get_int_property(ROCKSDB_TOTAL_SST_FILES_SIZE)
+        shred_code_cf.get_int_property(RocksProperties::TOTAL_SST_FILES_SIZE)
     }
 
     pub fn is_primary_access(&self) -> bool {
@@ -3444,10 +3756,16 @@ fn commit_slot_meta_working_set(
     Ok((should_signal, newly_completed_slots))
 }
 
-// 1) Find the slot metadata in the cache of dirty slot metadata we've previously touched,
-// else:
-// 2) Search the database for that slot metadata. If still no luck, then:
-// 3) Create a dummy orphan slot in the database
+/// Returns the `SlotMeta` with the specified `slot_index`.  The resulting
+/// `SlotMeta` could be either from the cache or from the DB.  Specifically,
+/// the function:
+///
+/// 1) Finds the slot metadata in the cache of dirty slot metadata we've
+///    previously touched, otherwise:
+/// 2) Searches the database for that slot metadata. If still no luck, then:
+/// 3) Create a dummy orphan slot in the database.
+///
+/// Also see [`find_slot_meta_in_cached_state`] and [`find_slot_meta_in_db_else_create`].
 fn find_slot_meta_else_create<'a>(
     db: &Database,
     working_set: &'a HashMap<u64, SlotMetaWorkingSetEntry>,
@@ -3462,8 +3780,11 @@ fn find_slot_meta_else_create<'a>(
     }
 }
 
-// Search the database for that slot metadata. If still no luck, then
-// create a dummy orphan slot in the database
+/// A helper function to [`find_slot_meta_else_create`] that searches the
+/// `SlotMeta` based on the specified `slot` in `db` and updates `insert_map`.
+///
+/// If the specified `db` does not contain a matched entry, then it will create
+/// a dummy orphan slot in the database.
 fn find_slot_meta_in_db_else_create(
     db: &Database,
     slot: Slot,
@@ -3480,7 +3801,9 @@ fn find_slot_meta_in_db_else_create(
     Ok(insert_map.get(&slot).unwrap().clone())
 }
 
-// Find the slot metadata in the cache of dirty slot metadata we've previously touched
+/// Returns the `SlotMeta` of the specified `slot` from the two cached states:
+/// `working_set` and `chained_slots`.  If both contain the `SlotMeta`, then
+/// the latest one from the `working_set` will be returned.
 fn find_slot_meta_in_cached_state<'a>(
     working_set: &'a HashMap<u64, SlotMetaWorkingSetEntry>,
     chained_slots: &'a HashMap<u64, Rc<RefCell<SlotMeta>>>,
@@ -3652,7 +3975,7 @@ fn handle_chaining_for_slot(
 /// `slot_meta`: the SlotMeta of the above `slot`.
 /// `working_set`: a slot-id to SlotMetaWorkingSetEntry map which is used
 ///   to traverse the graph.
-/// `passed_visisted_slots`: all the traversed slots which have passed the
+/// `passed_visited_slots`: all the traversed slots which have passed the
 ///   slot_function.  This may also include the input `slot`.
 /// `slot_function`: a function which updates the SlotMeta of the visisted
 ///   slots and determine whether to further traverse the children slots of
@@ -3735,17 +4058,20 @@ pub fn create_new_ledger(
     genesis_config: &GenesisConfig,
     max_genesis_archive_unpacked_size: u64,
     access_type: AccessType,
+    shred_storage_type: ShredStorageType,
 ) -> Result<Hash> {
     Blockstore::destroy(ledger_path)?;
     genesis_config.write(ledger_path)?;
 
     // Fill slot 0 with ticks that link back to the genesis_config to bootstrap the ledger.
+    let blockstore_dir = Blockstore::blockstore_directory(&shred_storage_type);
     let blockstore = Blockstore::open_with_options(
         ledger_path,
         BlockstoreOptions {
             access_type,
             recovery_mode: None,
             enforce_ulimit_nofile: false,
+            shred_storage_type: shred_storage_type.clone(),
         },
     )?;
     let ticks_per_slot = genesis_config.ticks_per_slot;
@@ -3778,7 +4104,7 @@ pub fn create_new_ledger(
         "-C",
         ledger_path.to_str().unwrap(),
         DEFAULT_GENESIS_FILE,
-        "rocksdb",
+        blockstore_dir,
     ];
     let output = std::process::Command::new("tar")
         .args(&args)
@@ -3835,11 +4161,11 @@ pub fn create_new_ledger(
                 )
             });
             fs::rename(
-                &ledger_path.join("rocksdb"),
-                ledger_path.join("rocksdb.failed"),
+                &ledger_path.join(blockstore_dir),
+                ledger_path.join(format!("{}.failed", blockstore_dir)),
             )
             .unwrap_or_else(|e| {
-                error_messages += &format!("/failed to stash problematic rocksdb: {}", e)
+                error_messages += &format!("/failed to stash problematic {}: {}", blockstore_dir, e)
             });
 
             return Err(BlockstoreError::Io(IoError::new(
@@ -3875,6 +4201,13 @@ macro_rules! get_tmp_ledger_path_auto_delete {
         $crate::blockstore::get_ledger_path_from_name_auto_delete($crate::tmp_ledger_name!())
     };
 }
+
+macro_rules! rocksdb_cf_metric {
+    ($tag_name:literal) => {
+        concat!("blockstore_rocksdb_cfs,cf_name=", $tag_name)
+    };
+}
+use rocksdb_cf_metric;
 
 pub fn get_ledger_path_from_name_auto_delete(name: &str) -> TempDir {
     let mut path = get_ledger_path_from_name(name);
@@ -3915,6 +4248,7 @@ macro_rules! create_new_tmp_ledger {
             $crate::tmp_ledger_name!(),
             $genesis_config,
             $crate::blockstore_db::AccessType::PrimaryOnly,
+            $crate::blockstore_db::ShredStorageType::default(),
         )
     };
 }
@@ -3926,6 +4260,21 @@ macro_rules! create_new_tmp_ledger_auto_delete {
             $crate::tmp_ledger_name!(),
             $genesis_config,
             $crate::blockstore_db::AccessType::PrimaryOnly,
+            $crate::blockstore_db::ShredStorageType::default(),
+        )
+    };
+}
+
+#[macro_export]
+macro_rules! create_new_tmp_ledger_fifo_auto_delete {
+    ($genesis_config:expr) => {
+        $crate::blockstore::create_new_ledger_from_name_auto_delete(
+            $crate::tmp_ledger_name!(),
+            $genesis_config,
+            $crate::blockstore_db::AccessType::PrimaryOnly,
+            $crate::blockstore_db::ShredStorageType::RocksFifo(
+                $crate::blockstore_db::BlockstoreRocksFifoOptions::default(),
+            ),
         )
     };
 }
@@ -3956,9 +4305,14 @@ pub fn create_new_ledger_from_name(
     name: &str,
     genesis_config: &GenesisConfig,
     access_type: AccessType,
+    shred_storage_type: ShredStorageType,
 ) -> (PathBuf, Hash) {
-    let (ledger_path, blockhash) =
-        create_new_ledger_from_name_auto_delete(name, genesis_config, access_type);
+    let (ledger_path, blockhash) = create_new_ledger_from_name_auto_delete(
+        name,
+        genesis_config,
+        access_type,
+        shred_storage_type,
+    );
     (ledger_path.into_path(), blockhash)
 }
 
@@ -3970,6 +4324,7 @@ pub fn create_new_ledger_from_name_auto_delete(
     name: &str,
     genesis_config: &GenesisConfig,
     access_type: AccessType,
+    shred_storage_type: ShredStorageType,
 ) -> (TempDir, Hash) {
     let ledger_path = get_ledger_path_from_name_auto_delete(name);
     let blockhash = create_new_ledger(
@@ -3977,6 +4332,7 @@ pub fn create_new_ledger_from_name_auto_delete(
         genesis_config,
         MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
         access_type,
+        shred_storage_type,
     )
     .unwrap();
     (ledger_path, blockhash)
@@ -4119,6 +4475,7 @@ pub mod tests {
     use {
         super::*,
         crate::{
+            blockstore_db::BlockstoreRocksFifoOptions,
             genesis_utils::{create_genesis_config, GenesisConfigInfo},
             leader_schedule::{FixedSchedule, LeaderSchedule},
             shred::{max_ticks_per_n_shreds, DataShredHeader},
@@ -4175,6 +4532,53 @@ pub mod tests {
         let entries = blockstore.get_slot_entries(0, 0).unwrap();
 
         assert_eq!(ticks, entries);
+        assert!(Path::new(ledger_path.path())
+            .join(Blockstore::blockstore_directory(
+                &ShredStorageType::RocksLevel,
+            ))
+            .exists());
+    }
+
+    #[test]
+    fn test_create_new_ledger_with_options_fifo() {
+        solana_logger::setup();
+        let mint_total = 1_000_000_000_000;
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(mint_total);
+        let (ledger_path, _blockhash) = create_new_tmp_ledger_fifo_auto_delete!(&genesis_config);
+        let blockstore = Blockstore::open_with_options(
+            ledger_path.path(),
+            BlockstoreOptions {
+                shred_storage_type: ShredStorageType::RocksFifo(
+                    BlockstoreRocksFifoOptions::default(),
+                ),
+                ..BlockstoreOptions::default()
+            },
+        )
+        .unwrap();
+
+        let ticks = create_ticks(genesis_config.ticks_per_slot, 0, genesis_config.hash());
+        let entries = blockstore.get_slot_entries(0, 0).unwrap();
+
+        assert_eq!(ticks, entries);
+        assert!(Path::new(ledger_path.path())
+            .join(Blockstore::blockstore_directory(
+                &ShredStorageType::RocksFifo(BlockstoreRocksFifoOptions::default())
+            ))
+            .exists());
+    }
+
+    #[test]
+    fn test_rocksdb_directory() {
+        assert_eq!(
+            Blockstore::blockstore_directory(&ShredStorageType::RocksLevel),
+            BLOCKSTORE_DIRECTORY_ROCKS_LEVEL
+        );
+        assert_eq!(
+            Blockstore::blockstore_directory(&ShredStorageType::RocksFifo(
+                BlockstoreRocksFifoOptions::default()
+            )),
+            BLOCKSTORE_DIRECTORY_ROCKS_FIFO
+        );
     }
 
     #[test]
@@ -6234,7 +6638,7 @@ pub mod tests {
             .map(|transaction| {
                 let mut pre_balances: Vec<u64> = vec![];
                 let mut post_balances: Vec<u64> = vec![];
-                for i in 0..transaction.message.total_account_keys_len() {
+                for i in 0..transaction.message.static_account_keys().len() {
                     pre_balances.push(i as u64 * 10);
                     post_balances.push(i as u64 * 11);
                 }
@@ -6292,7 +6696,7 @@ pub mod tests {
                     .unwrap();
                 VersionedTransactionWithStatusMeta {
                     transaction,
-                    meta: Some(TransactionStatusMeta {
+                    meta: TransactionStatusMeta {
                         status: Ok(()),
                         fee: 42,
                         pre_balances,
@@ -6303,21 +6707,22 @@ pub mod tests {
                         post_token_balances: Some(vec![]),
                         rewards: Some(vec![]),
                         loaded_addresses: LoadedAddresses::default(),
-                    }),
+                    },
                 }
             })
             .collect();
 
         // Even if marked as root, a slot that is empty of entries should return an error
-        let confirmed_block_err = blockstore.get_rooted_block(slot - 1, true).unwrap_err();
-        assert_matches!(confirmed_block_err, BlockstoreError::SlotUnavailable);
+        assert_matches!(
+            blockstore.get_rooted_block(slot - 1, true),
+            Err(BlockstoreError::SlotUnavailable)
+        );
 
         // The previous_blockhash of `expected_block` is default because its parent slot is a root,
         // but empty of entries (eg. snapshot root slots). This now returns an error.
-        let confirmed_block_err = blockstore.get_rooted_block(slot, true).unwrap_err();
         assert_matches!(
-            confirmed_block_err,
-            BlockstoreError::ParentEntriesUnavailable
+            blockstore.get_rooted_block(slot, true),
+            Err(BlockstoreError::ParentEntriesUnavailable)
         );
 
         // Test if require_previous_blockhash is false
@@ -7101,7 +7506,7 @@ pub mod tests {
             .map(|transaction| {
                 let mut pre_balances: Vec<u64> = vec![];
                 let mut post_balances: Vec<u64> = vec![];
-                for i in 0..transaction.message.total_account_keys_len() {
+                for i in 0..transaction.message.static_account_keys().len() {
                     pre_balances.push(i as u64 * 10);
                     post_balances.push(i as u64 * 11);
                 }
@@ -7133,7 +7538,7 @@ pub mod tests {
                     .unwrap();
                 VersionedTransactionWithStatusMeta {
                     transaction,
-                    meta: Some(TransactionStatusMeta {
+                    meta: TransactionStatusMeta {
                         status: Ok(()),
                         fee: 42,
                         pre_balances,
@@ -7144,7 +7549,7 @@ pub mod tests {
                         post_token_balances,
                         rewards,
                         loaded_addresses: LoadedAddresses::default(),
-                    }),
+                    },
                 }
             })
             .collect();
@@ -7153,9 +7558,9 @@ pub mod tests {
             let signature = tx_with_meta.transaction.signatures[0];
             assert_eq!(
                 blockstore.get_rooted_transaction(signature).unwrap(),
-                Some(VersionedConfirmedTransactionWithStatusMeta {
+                Some(ConfirmedTransactionWithStatusMeta {
                     slot,
-                    tx_with_meta: tx_with_meta.clone(),
+                    tx_with_meta: TransactionWithStatusMeta::Complete(tx_with_meta.clone()),
                     block_time: None
                 })
             );
@@ -7163,9 +7568,9 @@ pub mod tests {
                 blockstore
                     .get_complete_transaction(signature, slot + 1)
                     .unwrap(),
-                Some(VersionedConfirmedTransactionWithStatusMeta {
+                Some(ConfirmedTransactionWithStatusMeta {
                     slot,
-                    tx_with_meta,
+                    tx_with_meta: TransactionWithStatusMeta::Complete(tx_with_meta),
                     block_time: None
                 })
             );
@@ -7203,7 +7608,7 @@ pub mod tests {
             .map(|transaction| {
                 let mut pre_balances: Vec<u64> = vec![];
                 let mut post_balances: Vec<u64> = vec![];
-                for i in 0..transaction.message.total_account_keys_len() {
+                for i in 0..transaction.message.static_account_keys().len() {
                     pre_balances.push(i as u64 * 10);
                     post_balances.push(i as u64 * 11);
                 }
@@ -7235,7 +7640,7 @@ pub mod tests {
                     .unwrap();
                 VersionedTransactionWithStatusMeta {
                     transaction,
-                    meta: Some(TransactionStatusMeta {
+                    meta: TransactionStatusMeta {
                         status: Ok(()),
                         fee: 42,
                         pre_balances,
@@ -7246,7 +7651,7 @@ pub mod tests {
                         post_token_balances,
                         rewards,
                         loaded_addresses: LoadedAddresses::default(),
-                    }),
+                    },
                 }
             })
             .collect();
@@ -7257,9 +7662,9 @@ pub mod tests {
                 blockstore
                     .get_complete_transaction(signature, slot)
                     .unwrap(),
-                Some(VersionedConfirmedTransactionWithStatusMeta {
+                Some(ConfirmedTransactionWithStatusMeta {
                     slot,
-                    tx_with_meta,
+                    tx_with_meta: TransactionWithStatusMeta::Complete(tx_with_meta),
                     block_time: None
                 })
             );
@@ -7315,8 +7720,6 @@ pub mod tests {
                 )
                 .unwrap();
         }
-        // Purge to freeze index 0
-        blockstore.run_purge(0, 1, PurgeType::PrimaryIndex).unwrap();
         let slot1 = 20;
         for x in 5..9 {
             let signature = Signature::new(&[x; 64]);
@@ -7465,8 +7868,6 @@ pub mod tests {
                 )
                 .unwrap();
         }
-        // Purge to freeze index 0
-        blockstore.run_purge(0, 1, PurgeType::PrimaryIndex).unwrap();
         for x in 7..9 {
             let signature = Signature::new(&[x; 64]);
             blockstore
@@ -7524,6 +7925,9 @@ pub mod tests {
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
 
+        let (shreds, _) = make_slot_entries(1, 0, 4);
+        blockstore.insert_shreds(shreds, None, false).unwrap();
+
         fn make_slot_entries_with_transaction_addresses(addresses: &[Pubkey]) -> Vec<Entry> {
             let mut entries: Vec<Entry> = Vec::new();
             for address in addresses {
@@ -7551,18 +7955,14 @@ pub mod tests {
             let shreds = entries_to_test_shreds(&entries, slot, slot - 1, true, 0);
             blockstore.insert_shreds(shreds, None, false).unwrap();
 
-            for (i, entry) in entries.into_iter().enumerate() {
-                if slot == 4 && i == 2 {
-                    // Purge to freeze index 0 and write address-signatures in new primary index
-                    blockstore.run_purge(0, 1, PurgeType::PrimaryIndex).unwrap();
-                }
+            for entry in entries.into_iter() {
                 for transaction in entry.transactions {
                     assert_eq!(transaction.signatures.len(), 1);
                     blockstore
                         .write_transaction_status(
                             slot,
                             transaction.signatures[0],
-                            transaction.message.static_account_keys_iter().collect(),
+                            transaction.message.static_account_keys().iter().collect(),
                             vec![],
                             TransactionStatusMeta::default(),
                         )
@@ -7586,7 +7986,7 @@ pub mod tests {
                         .write_transaction_status(
                             slot,
                             transaction.signatures[0],
-                            transaction.message.static_account_keys_iter().collect(),
+                            transaction.message.static_account_keys().iter().collect(),
                             vec![],
                             TransactionStatusMeta::default(),
                         )
@@ -8017,6 +8417,16 @@ pub mod tests {
                 .unwrap();
             transactions.push(transaction.into());
         }
+
+        let map_result =
+            blockstore.map_transactions_to_statuses(slot, transactions.clone().into_iter());
+        assert!(map_result.is_ok());
+        let map = map_result.unwrap();
+        assert_eq!(map.len(), 4);
+        for (x, m) in map.iter().enumerate() {
+            assert_eq!(m.meta.fee, x as u64);
+        }
+
         // Push transaction that will not have matching status, as a test case
         transactions.push(
             Transaction::new_with_compiled_instructions(
@@ -8029,14 +8439,9 @@ pub mod tests {
             .into(),
         );
 
-        let map_result = blockstore.map_transactions_to_statuses(slot, transactions.into_iter());
-        assert!(map_result.is_ok());
-        let map = map_result.unwrap();
-        assert_eq!(map.len(), 5);
-        for (x, m) in map.iter().take(4).enumerate() {
-            assert_eq!(m.meta.as_ref().unwrap().fee, x as u64);
-        }
-        assert_eq!(map[4].meta, None);
+        let map_result =
+            blockstore.map_transactions_to_statuses(slot, transactions.clone().into_iter());
+        assert_matches!(map_result, Err(BlockstoreError::MissingTransactionMetadata));
     }
 
     #[test]

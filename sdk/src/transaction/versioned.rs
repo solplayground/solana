@@ -17,6 +17,24 @@ use {
     std::cmp::Ordering,
 };
 
+/// Type that serializes to the string "legacy"
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Legacy {
+    Legacy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", untagged)]
+pub enum TransactionVersion {
+    Legacy(Legacy),
+    Number(u8),
+}
+
+impl TransactionVersion {
+    pub const LEGACY: Self = Self::Legacy(Legacy::Legacy);
+}
+
 // NOTE: Serialization-related changes must be paired with the direct read at sigverify.
 /// An atomic transaction
 #[derive(Debug, PartialEq, Default, Eq, Clone, Serialize, Deserialize, AbiExample)]
@@ -41,7 +59,7 @@ impl Sanitize for VersionedTransaction {
 
         // Signatures are verified before message keys are loaded so all signers
         // must correspond to static account keys.
-        if self.signatures.len() > self.message.static_account_keys_len() {
+        if self.signatures.len() > self.message.static_account_keys().len() {
             return Err(SanitizeError::IndexOutOfBounds);
         }
 
@@ -93,6 +111,14 @@ impl VersionedTransaction {
         })
     }
 
+    /// Returns the version of the transaction
+    pub fn version(&self) -> TransactionVersion {
+        match self.message {
+            VersionedMessage::Legacy(_) => TransactionVersion::LEGACY,
+            VersionedMessage::V0(_) => TransactionVersion::Number(0),
+        }
+    }
+
     /// Returns a legacy transaction if the transaction message is legacy.
     pub fn into_legacy_transaction(self) -> Option<Transaction> {
         match self.message {
@@ -127,7 +153,7 @@ impl VersionedTransaction {
     fn _verify_with_results(&self, message_bytes: &[u8]) -> Vec<bool> {
         self.signatures
             .iter()
-            .zip(self.message.static_account_keys_iter())
+            .zip(self.message.static_account_keys().iter())
             .map(|(signature, pubkey)| signature.verify(pubkey.as_ref(), message_bytes))
             .collect()
     }

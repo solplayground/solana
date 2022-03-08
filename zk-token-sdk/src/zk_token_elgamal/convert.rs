@@ -21,9 +21,16 @@ mod target_arch {
                 pedersen::PedersenCommitment,
             },
             errors::ProofError,
+            instruction::{
+                transfer::{TransferAmountEncryption, TransferPubkeys},
+                transfer_with_fee::{FeeEncryption, FeeParameters, TransferWithFeePubkeys},
+            },
             range_proof::{errors::RangeProofError, RangeProof},
             sigma_proofs::{
-                equality_proof::EqualityProof, errors::*, validity_proof::ValidityProof,
+                equality_proof::{CtxtCommEqualityProof, CtxtCtxtEqualityProof},
+                errors::*,
+                fee_proof::FeeSigmaProof,
+                validity_proof::{AggregatedValidityProof, ValidityProof},
                 zero_balance_proof::ZeroBalanceProof,
             },
         },
@@ -144,16 +151,30 @@ mod target_arch {
         }
     }
 
-    impl From<EqualityProof> for pod::EqualityProof {
-        fn from(proof: EqualityProof) -> Self {
+    impl From<CtxtCommEqualityProof> for pod::CtxtCommEqualityProof {
+        fn from(proof: CtxtCommEqualityProof) -> Self {
             Self(proof.to_bytes())
         }
     }
 
-    impl TryFrom<pod::EqualityProof> for EqualityProof {
+    impl TryFrom<pod::CtxtCommEqualityProof> for CtxtCommEqualityProof {
         type Error = EqualityProofError;
 
-        fn try_from(pod: pod::EqualityProof) -> Result<Self, Self::Error> {
+        fn try_from(pod: pod::CtxtCommEqualityProof) -> Result<Self, Self::Error> {
+            Self::from_bytes(&pod.0)
+        }
+    }
+
+    impl From<CtxtCtxtEqualityProof> for pod::CtxtCtxtEqualityProof {
+        fn from(proof: CtxtCtxtEqualityProof) -> Self {
+            Self(proof.to_bytes())
+        }
+    }
+
+    impl TryFrom<pod::CtxtCtxtEqualityProof> for CtxtCtxtEqualityProof {
+        type Error = EqualityProofError;
+
+        fn try_from(pod: pod::CtxtCtxtEqualityProof) -> Result<Self, Self::Error> {
             Self::from_bytes(&pod.0)
         }
     }
@@ -172,6 +193,20 @@ mod target_arch {
         }
     }
 
+    impl From<AggregatedValidityProof> for pod::AggregatedValidityProof {
+        fn from(proof: AggregatedValidityProof) -> Self {
+            Self(proof.to_bytes())
+        }
+    }
+
+    impl TryFrom<pod::AggregatedValidityProof> for AggregatedValidityProof {
+        type Error = ValidityProofError;
+
+        fn try_from(pod: pod::AggregatedValidityProof) -> Result<Self, Self::Error> {
+            Self::from_bytes(&pod.0)
+        }
+    }
+
     impl From<ZeroBalanceProof> for pod::ZeroBalanceProof {
         fn from(proof: ZeroBalanceProof) -> Self {
             Self(proof.to_bytes())
@@ -182,6 +217,20 @@ mod target_arch {
         type Error = ZeroBalanceProofError;
 
         fn try_from(pod: pod::ZeroBalanceProof) -> Result<Self, Self::Error> {
+            Self::from_bytes(&pod.0)
+        }
+    }
+
+    impl From<FeeSigmaProof> for pod::FeeSigmaProof {
+        fn from(proof: FeeSigmaProof) -> Self {
+            Self(proof.to_bytes())
+        }
+    }
+
+    impl TryFrom<pod::FeeSigmaProof> for FeeSigmaProof {
+        type Error = FeeSigmaProofError;
+
+        fn try_from(pod: pod::FeeSigmaProof) -> Result<Self, Self::Error> {
             Self::from_bytes(&pod.0)
         }
     }
@@ -244,6 +293,152 @@ mod target_arch {
             Self::from_bytes(&pod.0)
         }
     }
+
+    #[cfg(not(target_arch = "bpf"))]
+    impl TryFrom<RangeProof> for pod::RangeProof256 {
+        type Error = RangeProofError;
+
+        fn try_from(proof: RangeProof) -> Result<Self, Self::Error> {
+            if proof.ipp_proof.serialized_size() != 576 {
+                return Err(RangeProofError::Format);
+            }
+
+            let mut buf = [0_u8; 800];
+            buf[..32].copy_from_slice(proof.A.as_bytes());
+            buf[32..64].copy_from_slice(proof.S.as_bytes());
+            buf[64..96].copy_from_slice(proof.T_1.as_bytes());
+            buf[96..128].copy_from_slice(proof.T_2.as_bytes());
+            buf[128..160].copy_from_slice(proof.t_x.as_bytes());
+            buf[160..192].copy_from_slice(proof.t_x_blinding.as_bytes());
+            buf[192..224].copy_from_slice(proof.e_blinding.as_bytes());
+            buf[224..800].copy_from_slice(&proof.ipp_proof.to_bytes());
+            Ok(pod::RangeProof256(buf))
+        }
+    }
+
+    impl TryFrom<pod::RangeProof256> for RangeProof {
+        type Error = RangeProofError;
+
+        fn try_from(pod: pod::RangeProof256) -> Result<Self, Self::Error> {
+            Self::from_bytes(&pod.0)
+        }
+    }
+
+    impl From<TransferPubkeys> for pod::TransferPubkeys {
+        fn from(keys: TransferPubkeys) -> Self {
+            Self {
+                source_pubkey: keys.source_pubkey.into(),
+                destination_pubkey: keys.destination_pubkey.into(),
+                auditor_pubkey: keys.auditor_pubkey.into(),
+            }
+        }
+    }
+
+    impl TryFrom<pod::TransferPubkeys> for TransferPubkeys {
+        type Error = ProofError;
+
+        fn try_from(pod: pod::TransferPubkeys) -> Result<Self, Self::Error> {
+            Ok(Self {
+                source_pubkey: pod.source_pubkey.try_into()?,
+                destination_pubkey: pod.destination_pubkey.try_into()?,
+                auditor_pubkey: pod.auditor_pubkey.try_into()?,
+            })
+        }
+    }
+
+    impl From<TransferWithFeePubkeys> for pod::TransferWithFeePubkeys {
+        fn from(keys: TransferWithFeePubkeys) -> Self {
+            Self {
+                source_pubkey: keys.source_pubkey.into(),
+                destination_pubkey: keys.destination_pubkey.into(),
+                auditor_pubkey: keys.auditor_pubkey.into(),
+                withdraw_withheld_authority_pubkey: keys.withdraw_withheld_authority_pubkey.into(),
+            }
+        }
+    }
+
+    impl TryFrom<pod::TransferWithFeePubkeys> for TransferWithFeePubkeys {
+        type Error = ProofError;
+
+        fn try_from(pod: pod::TransferWithFeePubkeys) -> Result<Self, Self::Error> {
+            Ok(Self {
+                source_pubkey: pod.source_pubkey.try_into()?,
+                destination_pubkey: pod.destination_pubkey.try_into()?,
+                auditor_pubkey: pod.auditor_pubkey.try_into()?,
+                withdraw_withheld_authority_pubkey: pod
+                    .withdraw_withheld_authority_pubkey
+                    .try_into()?,
+            })
+        }
+    }
+
+    impl From<TransferAmountEncryption> for pod::TransferAmountEncryption {
+        fn from(ciphertext: TransferAmountEncryption) -> Self {
+            Self {
+                commitment: ciphertext.commitment.into(),
+                source_handle: ciphertext.source_handle.into(),
+                destination_handle: ciphertext.destination_handle.into(),
+                auditor_handle: ciphertext.auditor_handle.into(),
+            }
+        }
+    }
+
+    impl TryFrom<pod::TransferAmountEncryption> for TransferAmountEncryption {
+        type Error = ProofError;
+
+        fn try_from(pod: pod::TransferAmountEncryption) -> Result<Self, Self::Error> {
+            Ok(Self {
+                commitment: pod.commitment.try_into()?,
+                source_handle: pod.source_handle.try_into()?,
+                destination_handle: pod.destination_handle.try_into()?,
+                auditor_handle: pod.auditor_handle.try_into()?,
+            })
+        }
+    }
+
+    impl From<FeeEncryption> for pod::FeeEncryption {
+        fn from(ciphertext: FeeEncryption) -> Self {
+            Self {
+                commitment: ciphertext.commitment.into(),
+                destination_handle: ciphertext.destination_handle.into(),
+                withdraw_withheld_authority_handle: ciphertext
+                    .withdraw_withheld_authority_handle
+                    .into(),
+            }
+        }
+    }
+
+    impl TryFrom<pod::FeeEncryption> for FeeEncryption {
+        type Error = ProofError;
+
+        fn try_from(pod: pod::FeeEncryption) -> Result<Self, Self::Error> {
+            Ok(Self {
+                commitment: pod.commitment.try_into()?,
+                destination_handle: pod.destination_handle.try_into()?,
+                withdraw_withheld_authority_handle: pod
+                    .withdraw_withheld_authority_handle
+                    .try_into()?,
+            })
+        }
+    }
+
+    impl From<FeeParameters> for pod::FeeParameters {
+        fn from(parameters: FeeParameters) -> Self {
+            Self {
+                fee_rate_basis_points: parameters.fee_rate_basis_points.into(),
+                maximum_fee: parameters.maximum_fee.into(),
+            }
+        }
+    }
+
+    impl From<pod::FeeParameters> for FeeParameters {
+        fn from(pod: pod::FeeParameters) -> Self {
+            Self {
+                fee_rate_basis_points: pod.fee_rate_basis_points.into(),
+                maximum_fee: pod.maximum_fee.into(),
+            }
+        }
+    }
 }
 
 #[cfg(target_arch = "bpf")]
@@ -272,11 +467,7 @@ mod tests {
         let proof_deserialized: RangeProof = proof_serialized.try_into().unwrap();
 
         assert!(proof_deserialized
-            .verify(
-                vec![&comm.get_point().compress()],
-                vec![64],
-                &mut transcript_verify
-            )
+            .verify(vec![&comm], vec![64], &mut transcript_verify)
             .is_ok());
 
         // should fail to serialize to pod::RangeProof128
@@ -301,16 +492,12 @@ mod tests {
             &mut transcript_create,
         );
 
-        let comm_1_point = comm_1.get_point().compress();
-        let comm_2_point = comm_2.get_point().compress();
-        let comm_3_point = comm_3.get_point().compress();
-
         let proof_serialized: pod::RangeProof128 = proof.try_into().unwrap();
         let proof_deserialized: RangeProof = proof_serialized.try_into().unwrap();
 
         assert!(proof_deserialized
             .verify(
-                vec![&comm_1_point, &comm_2_point, &comm_3_point],
+                vec![&comm_1, &comm_2, &comm_3],
                 vec![64, 32, 32],
                 &mut transcript_verify,
             )
